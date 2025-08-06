@@ -1,0 +1,24 @@
+services:
+  backend:
+    build:
+      context: ./backend
+    ports:
+      - "8000:8000"
+    environment:
+      - PYTHONUNBUFFERED=1
+    develop:
+      watch:
+        - path: ./backend/app
+          target: /app/app
+          action: sync
+
+  frontend:
+    build:
+      context: ./frontend
+    ports:
+      - "8080:80"
+    develop:
+      watch:
+        - path: ./frontend
+          target: /usr/share/nginx/html
+          action: sync
