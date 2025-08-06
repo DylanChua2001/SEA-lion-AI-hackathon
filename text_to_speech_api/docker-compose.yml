@@ -1,0 +1,16 @@
+services:
+  tts-api:
+    build: .
+    command: uvicorn main:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+    # Optionally comment out volumes when using Docker's native watch
+    # volumes:
+    #   - ./:/app
+    develop:
+      watch:
+        - path: .
+          target: /app
+          action: sync
+          # Optional: restart the container on change
+          onChange: restart
