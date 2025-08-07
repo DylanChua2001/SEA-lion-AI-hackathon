@@ -1,15 +1,15 @@
 services:
   backend:
     build:
-      context: ./backend
+      context: ./backend/text_to_speech_api
     ports:
       - "8000:8000"
     environment:
       - PYTHONUNBUFFERED=1
     develop:
       watch:
-        - path: ./backend/app
-          target: /app/app
+        - path: ./backend/text_to_speech_api
+          target: /app
           action: sync
 
   frontend:
