@@ -1,0 +1,18 @@
+{
+    "manifest_version": 3,
+    "name": "Send Text to TTS",
+    "version": "1.0",
+    "description": "Send selected text to TTS API",
+    "permissions": [
+        "contextMenus",
+        "activeTab",
+        "scripting"
+    ],
+    "host_permissions": [
+        "https://www.google.com/*",
+        "https://eservices.healthhub.sg/*"
+    ],
+    "background": {
+        "service_worker": "background.js"
+    }
+}
