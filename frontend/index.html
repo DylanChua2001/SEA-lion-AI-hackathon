@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Text to Speech (FastAPI + gTTS)</title>
+  <style>
+    body { font-family: Arial, sans-serif; max-width: 400px; margin: 3em auto; }
+    label, textarea, select, button { width: 100%; margin: 0.7em 0; }
+    textarea { resize: vertical; }
+    audio { width: 100%; margin-top: 1em; }
+  </style>
+</head>
+<body>
+  <h2>Text to Speech</h2>
+  <label for="text">Enter text:</label>
+  <textarea id="text" rows="3">สวัสดีครับ</textarea>
+
+  <label for="lang">Language:</label>
+  <select id="lang">
+    <option value="en">English</option>
+    <option value="th">Thai</option>
+    <option value="fr">French</option>
+    <option value="ja">Japanese</option>
+    <option value="es">Spanish</option>
+    <option value="zh-CN">Chinese</option>
+    <!-- Add more as needed -->
+  </select>
+
+  <button id="speakBtn">Speak</button>
+
+  <audio id="audio" controls style="display:none"></audio>
+
+  <script>
+    document.getElementById('speakBtn').onclick = async function() {
+      const text = document.getElementById('text').value;
+      const lang = document.getElementById('lang').value;
+      const url = `http://localhost:8000/speak`;
+      const audioElem = document.getElementById('audio');
+      audioElem.style.display = 'none';
+
+      try {
+        const resp = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text: text, lang: lang })
+        });
+        if (!resp.ok) throw new Error("TTS API error");
+        const blob = await resp.blob();
+        const audioURL = URL.createObjectURL(blob);
+        audioElem.src = audioURL;
+        audioElem.style.display = '';
+        audioElem.play();
+      } catch (err) {
+        alert("Error: " + err.message);
+      }
+    };
+  </script>
+</body>
+</html>
