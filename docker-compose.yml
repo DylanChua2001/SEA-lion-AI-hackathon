@@ -12,6 +12,21 @@ services:
           target: /app
           action: sync
 
+  llm_api:
+    build:
+      context: ./backend/llm_api
+    ports:
+      - "8001:8000"
+    env_file:
+      - ./backend/llm_api/.env
+    environment:
+      - PYTHONUNBUFFERED=1
+    develop:
+      watch:
+        - path: ./backend/llm_api
+          target: /app
+          action: sync
+
   frontend:
     build:
       context: ./frontend
