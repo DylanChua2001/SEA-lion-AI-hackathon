@@ -15,10 +15,11 @@ function nodeToPath(el){
 
 function snapshot(){
   const buttons=[...document.querySelectorAll("a,button,[role='button']")]
-    .slice(0,200).map(b=>({text:b.innerText.trim().slice(0,120), selector: nodeToPath(b)}));
+    .slice(0,400).map(b=>({text:b.innerText.trim().slice(0,160), selector: nodeToPath(b)}));
   const inputs=[...document.querySelectorAll("input,textarea,select")]
     .slice(0,200).map(i=>({name:i.name||i.id||i.placeholder||i.ariaLabel||"", selector: nodeToPath(i)}));
-  return { url: location.href, title: document.title, buttons, inputs };
+  const raw_html = document.documentElement.outerHTML; // add this
+  return { url: location.href, title: document.title, buttons, inputs, raw_html };
 }
 
 function extractContains(q){

@@ -1,51 +1,89 @@
-import os, httpx
-from typing import Optional
+import json, re
+from typing import Optional, List
+from pydantic import BaseModel, Field
+from langchain_core.tools import StructuredTool
 
-PUPPETEER_BASE_URL = os.getenv("PUPPETEER_BASE_URL", "http://puppeteer:3000")
+def build_tools(page: dict) -> List[StructuredTool]:
+    class FindInput(BaseModel):
+        query: str = Field(..., description="Text to search in labels/link text/selectors")
 
-class BrowserSession:
-    def __init__(self, session_id: str):
-        self.session_id = session_id
+    class ClickInput(BaseModel):
+        selector: str
 
-async def browser_start(headless: bool = True) -> BrowserSession:
-    async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.post(f"{PUPPETEER_BASE_URL}/session/start", json={"headless": headless})
-        r.raise_for_status()
-        sid = r.json()["sessionId"]
-        return BrowserSession(sid)
+    class TypeInput(BaseModel):
+        selector: str
+        text: str
 
-async def browser_goto(session: BrowserSession, url: str):
-    async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.post(f"{PUPPETEER_BASE_URL}/session/{session.session_id}/navigate", json={"url": url})
-        r.raise_for_status()
-        return r.json()
+    class DoneInput(BaseModel):
+        reason: str
 
-async def browser_click(session: BrowserSession, selector: str):
-    async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.post(f"{PUPPETEER_BASE_URL}/session/{session.session_id}/click", json={"selector": selector})
-        r.raise_for_status()
-        return r.json()
+    def _canon(s: str) -> str:
+        return re.sub(r"[^a-z0-9]+", " ", (s or "").lower()).strip()
 
-async def browser_type(session: BrowserSession, selector: str, text: str, press_enter: bool=False):
-    async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.post(
-            f"{PUPPETEER_BASE_URL}/session/{session.session_id}/type",
-            json={"selector": selector, "text": text, "pressEnter": press_enter},
-        )
-        r.raise_for_status()
-        return r.json()
+    def _overlap(a: str, b: str) -> int:
+        A = set(_canon(a).split())
+        B = set(_canon(b).split())
+        return len(A & B)
 
-async def browser_wait_for(session: BrowserSession, selector: str, timeout_ms: int = 30000):
-    async with httpx.AsyncClient(timeout=timeout_ms/1000 + 5) as client:
-        r = await client.post(
-            f"{PUPPETEER_BASE_URL}/session/{session.session_id}/waitFor",
-            json={"selector": selector, "timeout": timeout_ms},
-        )
-        r.raise_for_status()
-        return r.json()
+    def _search(q: str):
+        ql = _canon(q)
+        out = []
 
-async def browser_close(session: BrowserSession):
-    async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.post(f"{PUPPETEER_BASE_URL}/session/{session.session_id}/close")
-        r.raise_for_status()
-        return r.json()
+        def add(kind, item):
+            out.append({
+                "kind": kind,
+                "text": item.get("text") or item.get("name") or "",
+                "selector": item.get("selector", ""),
+            })
+
+        def matches(text: str, selector: str) -> bool:
+            if not ql: return False
+            tl = _canon(text)
+            sl = _canon(selector)
+            if ql in tl or ql in sl:
+                return True
+            # token overlap heuristic
+            return _overlap(ql, tl) > 0
+
+        for b in page.get("buttons", []):
+            if matches(b.get("text",""), b.get("selector","")):
+                add("button", b)
+        for a in page.get("links", []):
+            if matches(a.get("text",""), a.get("selector","")):
+                add("link", a)
+        for i in page.get("inputs", []):
+            hay = " ".join([i.get("name",""), i.get("placeholder",""), i.get("selector","")]).lower()
+            if ql and ql in hay:
+                add("input", i)
+        
+        # light scoring: prefer more overlap, then shorter selectors
+        def score(item):
+            ov = _overlap(ql, item["text"])
+            return (ov, -len(item.get("selector","")))
+        out.sort(key=score, reverse=True)
+        return out
+
+    def find_func(query: str) -> str:
+        matches = _search(query)
+        return json.dumps({"matches": matches[:3], "total": len(matches)})
+
+    def click_func(selector: str) -> str:
+        all_sel = {
+            *(x.get("selector","") for x in page.get("buttons", [])),
+            *(x.get("selector","") for x in page.get("links", [])),
+        }
+        return json.dumps({"ok": (selector in all_sel) or not all_sel, "selector": selector, "note": "proxy-click"})
+
+    def type_func(selector: str, text: str) -> str:
+        all_sel = {x.get("selector","") for x in page.get("inputs", [])}
+        return json.dumps({"ok": (selector in all_sel) or not all_sel, "selector": selector, "typed": text, "note": "proxy-type"})
+
+    def done_func(reason: str) -> str:
+        return json.dumps({"done": True, "reason": reason})
+
+    return [
+        StructuredTool.from_function(find_func,  name="find",  description="List candidate page elements/selectors", args_schema=FindInput),
+        StructuredTool.from_function(click_func, name="click", description="Click an element by selector (proxy)",   args_schema=ClickInput),
+        StructuredTool.from_function(type_func,  name="type",  description="Type into an input by selector (proxy)",args_schema=TypeInput),
+        StructuredTool.from_function(done_func,  name="done",  description="Call when the goal is achieved",         args_schema=DoneInput),
+    ]
