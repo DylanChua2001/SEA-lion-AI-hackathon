@@ -1,34 +1,49 @@
-const sleep = (ms) => new Promise(r=>setTimeout(r,ms));
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-function nodeToPath(el){
+function nodeToPath(el) {
   if (!el) return null;
   if (el.id) return `#${CSS.escape(el.id)}`;
-  const parts=[]; let n=el;
-  while (n && n.nodeType===1 && parts.length<6){
-    const name=n.tagName.toLowerCase();
-    const idx = Array.from(n.parentElement?.children || []).indexOf(n)+1;
+  const parts = []; let n = el;
+  while (n && n.nodeType === 1 && parts.length < 6) {
+    const name = n.tagName.toLowerCase();
+    const idx = Array.from(n.parentElement?.children || []).indexOf(n) + 1;
     parts.unshift(`${name}:nth-child(${idx})`);
-    n=n.parentElement;
+    n = n.parentElement;
   }
   return parts.join(">");
 }
 
-function snapshot(){
-  const buttons=[...document.querySelectorAll("a,button,[role='button']")]
-    .slice(0,400).map(b=>({text:b.innerText.trim().slice(0,160), selector: nodeToPath(b)}));
-  const inputs=[...document.querySelectorAll("input,textarea,select")]
-    .slice(0,200).map(i=>({name:i.name||i.id||i.placeholder||i.ariaLabel||"", selector: nodeToPath(i)}));
+function snapshot() {
+  const buttons = [...document.querySelectorAll("a,button,[role='button']")]
+    .slice(0, 400).map(b => ({
+      text: (b.innerText || "").trim().slice(0, 160),
+      selector: nodeToPath(b)
+    }));
+  const links = [...document.querySelectorAll("a[href]")]
+    .slice(0, 400).map(a => ({
+      text: (a.innerText || "").trim().slice(0, 200),
+      selector: nodeToPath(a),
+      href: a.href
+    }));
+  const inputs = [...document.querySelectorAll("input,textarea,select")]
+    .slice(0, 200).map(i => ({ name: i.name || i.id || i.placeholder || i.ariaLabel || "", selector: nodeToPath(i) }));
   const raw_html = document.documentElement.outerHTML; // add this
-  return { url: location.href, title: document.title, buttons, inputs, raw_html };
+  const nav_links = [...document.querySelectorAll('nav a,[role="navigation"] a')].slice(0, 200)
+    .map(a => ({ text: a.innerText.trim(), selector: nodeToPath(a), href: a.href }));
+  const breadcrumbs = [...document.querySelectorAll('[aria-label*="breadcrumb" i] a')].slice(0, 20)
+    .map(a => ({ text: a.innerText.trim(), selector: nodeToPath(a), href: a.href }));
+  const headings = [...document.querySelectorAll('h1,h2,[role="heading"]')].slice(0, 50)
+    .map(h => ({ text: (h.innerText || "").trim().slice(0, 200), selector: nodeToPath(h) }));
+  return { url: location.href, title: document.title, buttons, links, inputs, nav_links, breadcrumbs, headings, raw_html };
 }
 
-function extractContains(q){
+function extractContains(q) {
   // supports a:contains('Text') or :contains("Text")
   const m = q.match(/:contains\((['"])(.*?)\1\)/i);
   return m ? m[2] : null;
 }
 
-async function findImpl({ query, max=10 }){
+async function findImpl({ query, max = 10 }) {
   const raw = (query || "").trim();
   const contains = extractContains(raw);
   let textQuery = contains || raw.replace(/^a:/i, "").trim(); // fallback to raw as text
@@ -44,36 +59,36 @@ async function findImpl({ query, max=10 }){
     return { el, text, score };
   }).filter(x => x.score > 0);
 
-  scored.sort((a,b)=>b.score - a.score);
+  scored.sort((a, b) => b.score - a.score);
   const top = scored.slice(0, max).map(x => ({ text: x.text, selector: nodeToPath(x.el) }));
   return { candidates: top };
 }
 
-async function clickImpl({ selector, text, query }){
+async function clickImpl({ selector, text, query }) {
   let el = selector ? document.querySelector(selector) : null;
-  if (!el && (text || query)){
+  if (!el && (text || query)) {
     const needle = (text || query || "").toLowerCase();
     el = [...document.querySelectorAll("a,button,[role='button']")]
       .find(e => (e.innerText || "").trim().toLowerCase().includes(needle));
   }
   if (!el) throw new Error("element not found");
   el.click();
-  return { clicked: nodeToPath(el) };
+  const href = (el.tagName === "A" && el.href) ? el.href : null;
+  return { clicked: nodeToPath(el), href };
 }
 
-
-async function typeImpl({ selector, value }){
+async function typeImpl({ selector, value }) {
   const el = document.querySelector(selector);
   if (!el) throw new Error("input not found");
-  el.focus(); el.value=""; el.dispatchEvent(new Event("input",{bubbles:true}));
+  el.focus(); el.value = ""; el.dispatchEvent(new Event("input", { bubbles: true }));
   el.value = value ?? "";
-  el.dispatchEvent(new Event("input",{bubbles:true}));
+  el.dispatchEvent(new Event("input", { bubbles: true }));
   return { typed: value };
 }
 
-async function waitForImpl({ selector, timeout=15000 }){
+async function waitForImpl({ selector, timeout = 15000 }) {
   const t0 = performance.now();
-  while (performance.now()-t0 < timeout){
+  while (performance.now() - t0 < timeout) {
     const el = document.querySelector(selector);
     if (el) return { ok: true };
     await sleep(200);
@@ -81,33 +96,60 @@ async function waitForImpl({ selector, timeout=15000 }){
   throw new Error("timeout");
 }
 
-async function navImpl({ url }){
+async function navImpl({ url }) {
   location.href = url;
   return { navigating: url };
 }
 
+async function waitForLoadImpl({ timeout = 20000 }) {
+  const t0 = performance.now();
+  while (document.readyState !== "complete" && performance.now() - t0 < timeout) {
+    await sleep(100);
+  }
+  return { state: document.readyState, url: location.href };
+}
+
+async function waitForIdleImpl({ quietMs = 600, timeout = 8000 }) {
+  // crude "network idle": wait until DOM is complete and nothing changes for quietMs
+  const tEnd = performance.now() + timeout;
+  let last = document.body?.innerHTML?.length || 0;
+  while (performance.now() < tEnd) {
+    await sleep(quietMs);
+    const now = document.body?.innerHTML?.length || 0;
+    if (document.readyState === "complete" && now === last) return { idle: true };
+    last = now;
+  }
+  return { idle: false };
+}
+
+async function backImpl(){ history.back(); return { navigating:true }; }
+
 const TOOL_IMPL = {
-  get_page_state: async ()=> snapshot(),
+  get_page_state: async () => snapshot(),
   find: findImpl,
   click: clickImpl,
   type: typeImpl,
   wait_for: waitForImpl,
   nav: navImpl,
+  wait_for_load: waitForLoadImpl,
+  wait_for_idle: waitForIdleImpl,
 };
+
+TOOL_IMPL.back = backImpl;
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   (async () => {
     try {
-      if (msg?.type === "RUN_TOOL"){
+      if (msg?.type === "RUN_TOOL") {
         const fn = TOOL_IMPL[msg.tool];
-        if (!fn) return sendResponse({ ok:false, data:{error:"unknown tool"} });
+        if (!fn) return sendResponse({ ok: false, data: { error: "unknown tool" } });
         const data = await fn(msg.args || {});
-        sendResponse({ ok:true, data });
+        sendResponse({ ok: true, data });
       } else {
-        sendResponse({ ok:false, data:{error:"bad request"} });
+        sendResponse({ ok: false, data: { error: "bad request" } });
       }
-    } catch (e){
-      sendResponse({ ok:false, data:{error: e?.message || String(e)} });
+    } catch (e) {
+      sendResponse({ ok: false, data: { error: e?.message || String(e) } });
     }
   })();
   return true;
@@ -115,7 +157,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 
 console.log("[content] loaded");
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-  if (msg?.type === "PING") { sendResponse({ ok:true, pong:true }); return; }
+  if (msg?.type === "PING") { sendResponse({ ok: true, pong: true }); return; }
   // … your existing RUN_TOOL handler …
   return true;
 });

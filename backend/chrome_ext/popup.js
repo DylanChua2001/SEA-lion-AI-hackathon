@@ -1,13 +1,21 @@
 // popup.js
 const API = "http://127.0.0.1:8001"; // FastAPI
 
-function log(m) { const el = document.getElementById("log"); el.textContent += m + "\n"; el.scrollTop = el.scrollHeight; }
-async function getActiveTab() { const [t] = await chrome.tabs.query({ active: true, currentWindow: true }); return t; }
+function log(m) {
+  const el = document.getElementById("log");
+  el.textContent += m + "\n";
+  el.scrollTop = el.scrollHeight;
+}
+async function getActiveTab() {
+  const [t] = await chrome.tabs.query({ active: true, currentWindow: true });
+  return t;
+}
 
 document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("run").addEventListener("click", onRun);
 });
 
+// ---------- Local scoring helpers ----------
 function scoreClickable(text) {
   const t = (text || "").toLowerCase();
   let s = 0;
@@ -25,6 +33,13 @@ function scoreClickable(text) {
   return s;
 }
 
+function scorePreview({ title, snippet }, thing) {
+  const t = (title + " " + snippet).toLowerCase();
+  const verbs = /\b(new|create|add|book|apply|start|begin|schedule|register)\b/;
+  const s = (verbs.test(t) ? 1 : 0) + (t.includes((thing || "").toLowerCase()) ? 1 : 0);
+  return s;
+}
+
 function dedupeBySelector(items) {
   const seen = new Set();
   const out = [];
@@ -39,18 +54,27 @@ function dedupeBySelector(items) {
 }
 
 function compactClickableList(snapshot) {
-  // snapshot.buttons comes from content.js (a, button, [role=button])
   const raw = Array.isArray(snapshot?.buttons) ? snapshot.buttons : [];
-  // keep only items with some label; normalize and score
   const shaped = raw
     .map(b => ({ text: (b.text || "").trim(), selector: b.selector || "" }))
     .filter(b => b.selector && b.text)
     .map(b => ({ ...b, score: scoreClickable(b.text) }));
-
   const deduped = dedupeBySelector(shaped);
-  // rank by score desc, then shorter selector (more specific but not too long)
   deduped.sort((a, b) => (b.score - a.score) || (a.selector.length - b.selector.length));
   return deduped;
+}
+
+// Optional: background “SCOUT_URLS” previewer (CORS-safe HTML peek)
+async function scoutUrls(urls) {
+  return new Promise((resolve) => {
+    try {
+      chrome.runtime.sendMessage({ type: "SCOUT_URLS", urls }, (resp) => {
+        resolve(resp?.data || []);
+      });
+    } catch {
+      resolve([]);
+    }
+  });
 }
 
 async function onRun() {
@@ -66,85 +90,162 @@ async function onRun() {
   log("health: " + JSON.stringify(h));
   if (!h || h.ok !== true) return log("Backend not healthy");
 
-  // snapshot current page (structure sent to /agent/run)
-  const snap = await chrome.tabs.sendMessage(tab.id, { type: "RUN_TOOL", tool: "get_page_state", args: {} })
-    .catch(e => ({ ok: false, data: { error: String(e) } }));
-  if (!snap?.ok) {
-    log("snapshot failed: " + JSON.stringify(snap));
-    return;
-  }
-  const page_state = snap.data;
   const goal = (document.getElementById("goal")?.value || "Find the Book Appointment button").trim();
 
-  // send the full snapshot to the backend; the LLM normaliser will use everything
-  log(`Snapshot summary: buttons=${(page_state.buttons||[]).length}, inputs=${(page_state.inputs||[]).length}`);
-  const body = { goal, page_state };
-  log(">> /agent/run body (with clickables_preview): " + JSON.stringify(body, null, 0));
-
-  const res = await fetch(`${API}/agent/run`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body)
-  });
-
-  if (!res.ok) {
-    const txt = await res.text().catch(() => "<no body>");
-    log(`HTTP ${res.status}: ${txt}`);
-    return;
-  }
-
-  const payload = await res.json();
-  log("<< /agent/run response received.");
-
-  // Pretty-print the agent transcript
-  const msgs = payload?.messages || [];
-  for (const m of msgs) {
-    const t = m.type || "Message";
-    if (m.tool_calls && Array.isArray(m.tool_calls) && m.tool_calls.length) {
-      for (const tc of m.tool_calls) {
-        log(`${t}: TOOL ${tc.name} ${JSON.stringify(tc.args)}`);
-      }
-    } else {
-      log(`${t}: ${typeof m.content === "string" ? m.content : JSON.stringify(m.content)}`);
+  // Extract the 'thing' from the goal (generic create/book/apply detector)
+  const CREATE_VERBS = /\b(new|create|add|book|apply|start|begin|schedule|register)\b/i;
+  function extractThingFromGoal(g) {
+    const m = g.match(new RegExp(CREATE_VERBS.source + "\\s+(?:a|an|the)?\\s*([a-z0-9 \\-/]+)", "i"));
+    if (m) {
+      return m[1].trim().replace(/\b(on|for|to|at|in)\b.*$/i, "").trim();
     }
+    return "";
   }
+  const thing = extractThingFromGoal(goal);
 
-  // === NEW: execute EXECUTION_PLAN in the page ===
-  const planMsg = msgs.find(m => m.name === "EXECUTION_PLAN");
-  if (planMsg?.content) {
-    try {
-      const plan = JSON.parse(planMsg.content);
-      const steps = Array.isArray(plan.steps) ? plan.steps : [];
-      log(`EXECUTION_PLAN: ${steps.length} step(s)`);
+  // helper to run one tool via content.js
+  const runTool = (tool, args) =>
+    chrome.tabs.sendMessage(tab.id, { type: "RUN_TOOL", tool, args });
 
-      // helper to run one tool via content.js
-      const runTool = (tool, args) =>
-        chrome.tabs.sendMessage(tab.id, { type: "RUN_TOOL", tool, args });
+  let hops = 0;
+  let finished = false;
 
-      for (const step of steps) {
-        const { tool, args } = step || {};
-        if (!tool) continue;
-        if (tool === "done" || tool === "fail") {
-          log(`** ${tool.toUpperCase()}: ${JSON.stringify(args || {})}`);
-          break;
+  while (hops < 12 && !finished) {
+    // 1) snapshot current page
+    const snap = await runTool("get_page_state", {});
+    if (!snap?.ok) { log("snapshot failed: " + JSON.stringify(snap)); return; }
+    const page_state = snap.data;
+    log(`Snapshot: url=${page_state.url} buttons=${(page_state.buttons || []).length} links=${(page_state.links || []).length}`);
+
+    // 2) ask backend for this TURN
+    const body = { goal, page_state };
+    log(">> POST /agent/run (turn=" + (hops + 1) + ")");
+    const res = await fetch(`${API}/agent/run`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    });
+    if (!res.ok) { log(`HTTP ${res.status} on /agent/run`); return; }
+    const payload = await res.json();
+    const msgs = payload?.messages || [];
+    log("<< turn response, messages=" + msgs.length);
+
+    // pretty-print tool calls (optional)
+    for (const m of msgs) {
+      const t = m.type || "Message";
+      if (Array.isArray(m.tool_calls) && m.tool_calls.length) {
+        for (const tc of m.tool_calls) log(`${t}: TOOL ${tc.name} ${JSON.stringify(tc.args)}`);
+      }
+    }
+
+    // plan for this turn
+    const planMsg = msgs.find(m => m.name === "EXECUTION_PLAN");
+    const steps = planMsg?.content ? (JSON.parse(planMsg.content).steps || []) : [];
+    log(`EXECUTION_PLAN: ${steps.length} step(s)`);
+
+    // 3) execute plan; break early if we navigate
+    let navigated = false;
+    for (const step of steps) {
+      const { tool, args } = step || {};
+      if (!tool) continue;
+
+      // stop on terminal
+      if (tool === "done" || tool === "fail") {
+        log(`** ${tool.toUpperCase()}: ${JSON.stringify(args || {})}`);
+        finished = true;
+        break;
+      }
+
+      // map 'goto' to extension 'nav' (if backend emits goto)
+      if (tool === "goto") {
+        log(`>> RUN_TOOL nav ${JSON.stringify(args || {})}`);
+        const navObs = await runTool("nav", args || {});
+        log(`.. OBS nav: ${JSON.stringify(navObs || {})}`);
+        navigated = true;
+        log(".. waiting for load…");
+        await runTool("wait_for_load", { timeout: 25000 });
+        await runTool("wait_for_idle", { quietMs: 800, timeout: 6000 });
+        break;
+      }
+
+      // SPECIAL HANDLING: 'find' with multiple candidates → scout + score → click best
+      if (tool === "find") {
+        log(`>> RUN_TOOL find ${JSON.stringify(args || {})}`);
+        const obs = await runTool("find", args || {});
+        log(`.. OBS find: ${JSON.stringify(obs || {})}`);
+
+        const matches = obs?.data?.matches || [];
+        if (matches.length > 1) {
+          // Try to peek linked pages (when hrefs exist); cap for performance
+          const urls = matches.map(m => m.href).filter(Boolean).slice(0, 8);
+          if (urls.length && thing) {
+            const previews = await scoutUrls(urls);
+            const scored = previews.map((p, i) => ({
+              ...p,
+              selector: matches[i].selector,
+              text: matches[i].text || "",
+              score: scorePreview(p, thing)
+            }));
+            // fallback: if equal scores, prefer better on-page label
+            scored.sort((a, b) => (b.score - a.score) ||
+              (scoreClickable(b.text) - scoreClickable(a.text)) ||
+              (a.selector.length - b.selector.length));
+            const best = scored[0];
+            if (best?.selector) {
+              log(`Auto-select best candidate: ${best.title || best.url} (score ${best.score})`);
+              const clickObs = await runTool("click", { selector: best.selector });
+              log(`.. OBS click(best): ${JSON.stringify(clickObs || {})}`);
+              // if it navigated (href), wait and break turn
+              if (clickObs?.ok && (clickObs.data?.href || clickObs.data?.navigating)) {
+                navigated = true;
+                log(".. waiting for load…");
+                await runTool("wait_for_load", { timeout: 25000 });
+                await runTool("wait_for_idle", { quietMs: 800, timeout: 6000 });
+                break;
+              }
+              // otherwise just continue to next step
+              await new Promise(r => setTimeout(r, 200));
+              continue;
+            }
+          }
         }
-        log(`>> RUN_TOOL ${tool} ${JSON.stringify(args || {})}`);
-        const obs = await runTool(tool, args || {});
-        log(`.. OBS ${tool}: ${JSON.stringify(obs || {})}`);
-        // small pacing between actions
-        await new Promise(r => setTimeout(r, 200));
-      }
-    } catch (e) {
-      log(`EXECUTION_PLAN parse/exec error: ${e?.message || String(e)}`);
-    }
-  }
 
-  // Optional: surface 'done' summary if present
-  const last = msgs[msgs.length - 1];
-  if (last?.name === "done") {
-    try {
-      const info = JSON.parse(last.content || "{}");
-      if (info?.reason) log(`** DONE: ${info.reason}`);
-    } catch { }
+        // If not multi-match or no scouting possible, just proceed normally
+        await new Promise(r => setTimeout(r, 200));
+        continue;
+      }
+
+      // default path: run tool as-is
+      log(`>> RUN_TOOL ${tool} ${JSON.stringify(args || {})}`);
+      const obs = await runTool(tool, args || {});
+      log(`.. OBS ${tool}: ${JSON.stringify(obs || {})}`);
+
+      // If this step triggers navigation, pause the turn and loop.
+      if (tool === "nav" || (obs?.ok && (obs.data?.navigating || obs.data?.href))) {
+        navigated = true;
+        log(".. waiting for load…");
+        await runTool("wait_for_load", { timeout: 25000 });
+        await runTool("wait_for_idle", { quietMs: 800, timeout: 6000 });
+        break;
+      }
+
+      await new Promise(r => setTimeout(r, 200));
+    }
+
+    // check final message for 'done'
+    const last = msgs[msgs.length - 1];
+    if (last?.name === "done") {
+      try {
+        const info = JSON.parse(last.content || "{}");
+        if (info?.reason) log(`** DONE: ${info.reason}`);
+      } catch { /* ignore */ }
+      finished = true;
+    }
+
+    hops += 1;
+    if (!navigated && !finished) {
+      log("No navigation this turn; stopping to avoid loop.");
+      break;
+    }
   }
 }

@@ -3,7 +3,7 @@ import os
 SYSTEM = (
     "You are a web task agent. You cannot execute actions yourself.\n"
     "Choose exactly ONE tool per step by returning STRICT JSON only:\n"
-    '{"tool":"find|click|type|done","args":{...}}\n'
+    '{"tool":"find|click|type|goto|done","args":{...}}\n'
     "- Prefer robust selectors. If unsure, start with find, then click/type.\n"
     "- Stop with tool done as soon as the goal is achieved.\n"
     "- IMPORTANT: Output ONLY the JSON object, no markdown, no prose."
@@ -15,6 +15,7 @@ SCHEMA_HINT = (
     "- click: {\"selector\": \"<robust selector>\"}\n"
     "- type: {\"selector\": \"<robust selector>\", \"text\": \"<what to type>\"}\n"
     "- done: {\"reason\": \"<why we're done>\"}\n"
+    "- goto: {\"url\": \"<absolute or relative url>\"}\n"
     "Return ONLY one JSON object with keys tool, args."
 )
 

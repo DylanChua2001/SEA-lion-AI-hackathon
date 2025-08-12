@@ -14,6 +14,9 @@ def build_tools(page: dict) -> List[StructuredTool]:
         selector: str
         text: str
 
+    class GotoInput(BaseModel):
+        url: str
+
     class DoneInput(BaseModel):
         reason: str
 
@@ -34,6 +37,7 @@ def build_tools(page: dict) -> List[StructuredTool]:
                 "kind": kind,
                 "text": item.get("text") or item.get("name") or "",
                 "selector": item.get("selector", ""),
+                "href": item.get("href") or "",
             })
 
         def matches(text: str, selector: str) -> bool:
@@ -68,11 +72,27 @@ def build_tools(page: dict) -> List[StructuredTool]:
         return json.dumps({"matches": matches[:3], "total": len(matches)})
 
     def click_func(selector: str) -> str:
-        all_sel = {
-            *(x.get("selector","") for x in page.get("buttons", [])),
-            *(x.get("selector","") for x in page.get("links", [])),
-        }
-        return json.dumps({"ok": (selector in all_sel) or not all_sel, "selector": selector, "note": "proxy-click"})
+            # Collect known selectors
+            buttons = page.get("buttons", [])
+            links   = page.get("links", [])
+            all_sel = {*(x.get("selector","") for x in buttons), *(x.get("selector","") for x in links)}
+    
+            nav = None
+            # If it's a link, surface its href to trigger navigation outside
+            for a in links:
+                if a.get("selector","") == selector and a.get("href"):
+                    nav = a.get("href")
+                    break
+            return json.dumps({
+                "ok": (selector in all_sel) or not all_sel,
+                "selector": selector,
+                "navigate_to": nav,
+                "note": "proxy-click"
+            })
+    
+    def goto_func(url: str) -> str:
+        # Tell the orchestrator to navigate; it should fetch and pass a new page_state next turn
+        return json.dumps({"request_navigation": True, "url": url})
 
     def type_func(selector: str, text: str) -> str:
         all_sel = {x.get("selector","") for x in page.get("inputs", [])}
@@ -85,5 +105,6 @@ def build_tools(page: dict) -> List[StructuredTool]:
         StructuredTool.from_function(find_func,  name="find",  description="List candidate page elements/selectors", args_schema=FindInput),
         StructuredTool.from_function(click_func, name="click", description="Click an element by selector (proxy)",   args_schema=ClickInput),
         StructuredTool.from_function(type_func,  name="type",  description="Type into an input by selector (proxy)",args_schema=TypeInput),
+        StructuredTool.from_function(goto_func,  name="goto",  description="Navigate to a different URL (proxy)",    args_schema=GotoInput),
         StructuredTool.from_function(done_func,  name="done",  description="Call when the goal is achieved",         args_schema=DoneInput),
     ]

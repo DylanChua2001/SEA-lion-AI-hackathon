@@ -59,6 +59,23 @@ def build_app_for_page(page: dict):
                         )]}
                 except Exception:
                     pass
+            if last_name == "click":
+                # If the click result contains a URL, ask the runner to navigate now
+                try:
+                    payload = json.loads(state["messages"][-1].content or "{}")
+                    nav = payload.get("navigate_to")
+                    if nav:
+                        return {"messages": [AIMessage(
+                            content="",
+                            tool_calls=[{
+                                "id": f"call_goto_{uuid.uuid4().hex[:6]}",
+                                "type": "tool_call",
+                                "name": "goto",
+                                "args": {"url": nav},
+                            }]
+                        )]}
+                except Exception:
+                    pass
 
         # keep HTML extremely small; the vocab already carries labels
         raw_html_excerpt = ""
@@ -98,7 +115,7 @@ def build_app_for_page(page: dict):
 
     def after_tools(state: AgentState):
         last = state["messages"][-1]
-        if isinstance(last, ToolMessage) and getattr(last, "name", "").lower() == "done":
+        if isinstance(last, ToolMessage) and getattr(last, "name", "").lower() in ("done", "goto"):
             return END
         return "agent"
 
@@ -113,3 +130,4 @@ def build_app_for_page(page: dict):
     g.add_conditional_edges("tools", after_tools, {"agent": "agent", END: END})
 
     return g.compile(checkpointer=MemorySaver())
+

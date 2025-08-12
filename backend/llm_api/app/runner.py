@@ -19,7 +19,7 @@ def run_one(goal: str, page_state: str | dict, last_tool: Optional[str] = None, 
     if last_obs:
         msgs.append(HumanMessage(f"OBS: {last_obs}"))
 
-    cfg = {"configurable": {"thread_id": "web-agent"}, "recursion_limit": 40}
+    cfg = {"configurable": {"thread_id": "web-agent"}, "recursion_limit": 10}
     final_state = app.invoke({"messages": msgs}, config=cfg)
 
     plan = messages_to_plan(final_state["messages"])
