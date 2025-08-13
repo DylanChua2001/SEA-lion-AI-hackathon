@@ -11,7 +11,19 @@
 </head>
 <body>
   <h3>HealthHub Agent</h3>
+  <p style="font-size:12px;color:#666;margin:8px 0;">
+    The agent may pause to ask a question if it’s unsure. Your reply will resume the flow.
+  </p>
   <textarea id="goal" placeholder="Describe what you want to do..."></textarea>
+  <!-- Add inside the body, e.g. under your goal textarea -->
+  <div id="clarify" style="display:none; border:1px solid #e5e7eb; border-radius:12px; padding:10px; margin:10px 0;">
+    <div id="clarify-text" style="font-size:13px; margin-bottom:6px;"></div>
+    <textarea id="clarify-input" rows="2" style="width:100%;"></textarea>
+    <div style="margin-top:6px; display:flex; gap:8px;">
+      <button id="clarify-ok">OK</button>
+      <button id="clarify-cancel">Cancel</button>
+    </div>
+  </div>
   <button id="run">Run Agent</button>
   <pre id="log"></pre>
   <script src="popup.js"></script>

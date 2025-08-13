@@ -38,9 +38,12 @@ def _serialize_messages(msgs) -> list[AgentMessage]:
 async def agent_run(req: AgentRunRequest) -> AgentRunResponse:
     msgs = run_one(
         goal=req.goal,
-        page_state=req.page_state,        # dict or JSON string; run_one handles both
+        page_state=req.page_state,
         last_tool=req.last_tool,
-        last_obs=req.last_observation,    # alias supported in schema
+        last_obs=req.last_observation,
+        # NEW:
+        user_reply=req.user_reply,
+        thread_id=req.thread_id or "web-agent",
     )
     return AgentRunResponse(messages=_serialize_messages(msgs))
 

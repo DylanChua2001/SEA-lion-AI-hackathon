@@ -14,6 +14,9 @@ class AgentRunRequest(BaseModel):
     page_state: Union[dict, str]
     last_tool: Optional[str] = None
     last_observation: Optional[str] = Field(default=None, alias="last_obs")  # allow either key
+    # NEW: for interrupt/resume
+    user_reply: Optional[str] = None                     # user's clarification when resuming
+    thread_id: Optional[str] = Field(default="web-agent")# keep constant across resumes
 
     class Config:
         populate_by_name = True  # let FastAPI accept last_obs or last_observation

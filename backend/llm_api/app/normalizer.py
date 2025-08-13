@@ -1,5 +1,5 @@
 import json, re
-from typing import List, Optional
+from typing import List, Optional, Dict, Tuple
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, AnyMessage
 from .config import NORMALIZER_SYSTEM
 from .llm import make_llm
@@ -35,7 +35,7 @@ def extract_thing(goal: str, page: dict) -> str:
     for k in ("buttons", "links"):
         for x in page.get(k, []):
             page_texts.append(x.get("text") or "")
-    counts = {t:0 for t in _tokens(g)}
+    counts = {t: 0 for t in _tokens(g)}
     for txt in page_texts:
         for t in _tokens(txt):
             if t in counts: counts[t] += 1
@@ -54,18 +54,18 @@ def build_query_set(goal: str, page: dict) -> dict:
         "create_queries": fill(CREATE_TERMS),
     }
 
-
-# normalizer.py (near top)
+# ── Canonical synonyms and page vocab snapping ───────────────────────────────
 SYNONYMS = {
     "appointments": ["appointment", "appointments", "book", "schedule"],
     "payments": ["payment", "payments", "bill", "bills", "pay"],
+    "records": ["record", "records", "medical record", "immunisation", "immunisations", "immunization", "immunizations"],
     "results": ["result", "results", "lab", "lab results", "test", "tests"],
     "login": ["login", "log in", "sign in", "account"],
     "search": ["search", "find"],
 }
 
 def _pick_from_vocab(target: str, vocab: List[str]) -> str | None:
-# Support "A | B | C" (try in order)
+    # Support "A | B | C" (try in order)
     candidates = [s.strip() for s in (target or "").split("|") if s.strip()]
     if not candidates:
         candidates = [(target or "").strip()]
@@ -115,9 +115,100 @@ def build_page_vocab(page: dict, max_items: int = 80) -> List[str]:
 
     return out[:max_items]
 
-def llm_normalize_goal(raw_goal: str, page_vocab: List[str]) -> Optional[str]:
-    if not raw_goal: return None
+# ── Four-path router (hard rails) ────────────────────────────────────────────
+PATH_SYNONYMS = {
+    "appointments": ["appointment", "appointments", "book", "schedule", "reschedule", "cancel slot", "view appointments"],
+    "lab_results": ["lab", "labs", "result", "results", "test", "tests", "lab report", "reports"],
+    "payments": ["pay", "payment", "payments", "bill", "bills", "invoice", "outstanding", "fees"],
+    "immunisations": ["immunisation", "immunization", "vaccination", "vaccine", "jab", "shots", "immunisation records", "records"],
+}
 
+# Entry + Create queries per path (used for snapping + fallbacks)
+PATH_QUERIES: Dict[str, Dict[str, List[str]]] = {
+    "appointments": {
+        "entry": ["appointments", "manage appointments", "my appointments", "appointment centre"],
+        "create": ["book appointment", "new appointment", "schedule appointment", "book now"],
+    },
+    "lab_results": {
+        "entry": ["lab results", "results", "test results", "lab reports", "medical records"],
+        "create": [],  # usually view-only; keep create empty
+    },
+    "payments": {
+        "entry": ["payments", "pay bills", "outstanding bills", "billing", "make payment"],
+        "create": ["make payment", "pay now", "settle bill"],  # 'create' = initiate payment flow
+    },
+    "immunisations": {
+        "entry": ["immunisation records", "vaccination records", "records", "my records"],
+        "create": ["book vaccination", "schedule vaccination", "new vaccination", "book jab"],
+    },
+}
+
+def classify_path(goal: str) -> str:
+    """Map any free-form goal to one of the four canonical paths."""
+    g = (goal or "").lower()
+    # priority order if multiple match
+    order = ["appointments", "lab_results", "payments", "immunisations"]
+    for key in order:
+        for kw in PATH_SYNONYMS[key]:
+            if kw in g:
+                return key
+    # token fallback
+    toks = set(_tokens(g))
+    if {"appointment", "book", "schedule"} & toks: return "appointments"
+    if {"lab", "result", "results", "test", "report", "reports"} & toks: return "lab_results"
+    if {"pay", "payment", "payments", "bill", "bills", "invoice"} & toks: return "payments"
+    if {"immunisation", "immunization", "vaccination", "vaccine", "jab", "shots", "record", "records"} & toks:
+        return "immunisations"
+    # default: appointments
+    return "appointments"
+
+def _snap_any(candidates: List[str], page_vocab: List[str]) -> str | None:
+    for q in candidates:
+        hit = _pick_from_vocab(q, page_vocab)
+        if hit: return hit
+    return None
+
+def _plan_from_path(path: str, page_vocab: List[str], create_like: bool) -> str:
+    """Return a deterministic plan constrained to a single path."""
+    q = PATH_QUERIES.get(path, PATH_QUERIES["appointments"])
+    snapped_entry  = _snap_any(q["entry"],  page_vocab) or (q["entry"][0] if q["entry"] else "home")
+    if create_like and q["create"]:
+        snapped_create = _snap_any(q["create"], page_vocab) or q["create"][0]
+        # multi-hop plan (entry → create)
+        return (
+            f"find('{snapped_entry}') then click the best match, then wait(600), "
+            f"find('{snapped_create}') then click the best match, then wait(600), then done"
+        )
+    # single-hop plan (entry only / view)
+    return f"find('{snapped_entry}') then click the best match, then done"
+
+# ── Public: LLM normalizer with four-path hard routing ───────────────────────
+def llm_normalize_goal(raw_goal: str, page_vocab: List[str]) -> Optional[str]:
+    """
+    Always produce a canonical plan that maps to exactly ONE of:
+      - appointments | lab_results | payments | immunisations
+
+    If the goal contains create-like verbs, we use a two-step plan (entry → create).
+    Otherwise a single-hop plan to the path's entry surface.
+
+    We still keep your LLM few-shot as a *backstop* for rare cases where snapping
+    utterly fails, but the path is always constrained to the four rails.
+    """
+    if not raw_goal:
+        return None
+
+    # 1) Classify to one of the four paths
+    path = classify_path(raw_goal)
+
+    # 2) Decide if this is a "create-like" request
+    create_like = bool(re.search(rf"\b{GOAL_CREATE_VERBS}\b", raw_goal, flags=re.I))
+
+    # 3) Try a deterministic plan using page snapping
+    plan = _plan_from_path(path, page_vocab, create_like)
+    if plan:
+        return plan
+
+    # 4) (Rare) Backstop to your few-shot normalizer, but still snap to page and constrain to a single hop
     fewshot = [
         HumanMessage(content="Goal: manage my appointments\nPAGE_VOCAB: [\"Appointments\", \"Payments\", \"Lab Results\", \"Login\"]"),
         AIMessage(content='{"intent":"manage","target":"appointments","query":"appointments","canonical_goal":"find(\'appointments\') then click the best match, then done"}'),
@@ -125,43 +216,20 @@ def llm_normalize_goal(raw_goal: str, page_vocab: List[str]) -> Optional[str]:
         HumanMessage(content="Goal: pay outstanding bills\nPAGE_VOCAB: [\"Appointments\", \"Payments\", \"Lab Results\", \"Login\"]"),
         AIMessage(content='{"intent":"pay","target":"payments","query":"payments","canonical_goal":"find(\'payments\') then click the best match, then done"}'),
     ]
-
     llm = make_llm(temperature=0)
     messages: List[AnyMessage] = [SystemMessage(content=NORMALIZER_SYSTEM)] + fewshot + [
         HumanMessage(content=f"Goal: {raw_goal}\nPAGE_VOCAB: {json.dumps(page_vocab, ensure_ascii=False)}")
     ]
 
-    # 0) Generic manage→create recipe: if the goal sounds like "create/book/apply/start…"
-    if re.search(rf"\b{GOAL_CREATE_VERBS}\b", raw_goal, flags=re.I):
-        qs = build_query_set(raw_goal, {"buttons": [{"text": v} for v in page_vocab],
-                                        "links":   [{"text": v} for v in page_vocab]})
-        entry_or  = " | ".join(qs["entry_queries"])
-        create_or = " | ".join(qs["create_queries"])
-
-        # Try to snap each OR query to something actually on page (best-effort)
-        snapped_entry  = _pick_from_vocab(entry_or,  page_vocab) or entry_or
-        snapped_create = _pick_from_vocab(create_or, page_vocab) or create_or
-
-        # Deterministic, tool-friendly canonical plan (multi-hop)
-        return (
-            f"find('{snapped_entry}') then click the best match, then wait(600), "
-            f"find('{snapped_create}') then click the best match, then wait(600), then done"
-        )
-
-    # 1) Otherwise fall back to your existing few-shot LLM normalisation (single hop)
-    resp = llm.invoke(messages)
     try:
-        data = parse_strict_json(resp.content)
+        resp = llm.invoke(messages)
+        data = parse_strict_json(resp.content) or {}
     except Exception:
-        return None
+        data = {}
 
-    data = data or {}
-    q = (data.get("query") or "").strip()
-    snapped = _pick_from_vocab(q or (data.get("target") or ""), page_vocab)
-    if not snapped and page_vocab:
-        for prefer in ("appointments", "payments", "search", "results", "login"):
-            snapped = _pick_from_vocab(prefer, page_vocab)
-            if snapped: break
-    if snapped:
-        return f"find('{snapped}') then click the best match, then done"
-    return (data.get("canonical_goal") or "").strip() or None
+    q = (data.get("query") or data.get("target") or "").strip()
+    snapped = _pick_from_vocab(q, page_vocab)
+    if not snapped:
+        # last-resort: use the path entry again
+        snapped = _snap_any(PATH_QUERIES[path]["entry"], page_vocab) or PATH_QUERIES[path]["entry"][0]
+    return f"find('{snapped}') then click the best match, then done"
