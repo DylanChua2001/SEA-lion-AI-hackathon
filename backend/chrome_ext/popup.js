@@ -195,6 +195,9 @@ function buildAgentGuidanceText(info) {
 async function onRun() {
   const tab = await getActiveTab();
   if (!tab) return log("No active tab");
+  await chrome.tabs.update(tab.id, { url: "https://www.healthhub.sg/" });
+  await waitForTabNavigation(tab.id); 
+  await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ["content.js"] });
   if (!/^https?:\/\//.test(tab.url || "")) return log("Open a normal webpage first.");
 
   await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ["content.js"] });
