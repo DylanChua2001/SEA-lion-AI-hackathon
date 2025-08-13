@@ -75,7 +75,7 @@ async function waitForTabNavigation(tabId, { timeout = 25000 } = {}) {
   });
 }
 
-/* ---------- Scoring helpers ---------- */
+/* ---------- Scoring/helpers for nice inline guidance (unchanged) ---------- */
 function scoreClickable(text) {
   const t = (text || "").toLowerCase();
   let s = 0;
@@ -91,20 +91,14 @@ function scoreClickable(text) {
   s += Math.min(6, Math.max(0, Math.floor((t.length - 8) / 10)));
   return s;
 }
-
 function dedupeBySelector(items) {
-  const seen = new Set();
-  const out = [];
+  const seen = new Set(); const out = [];
   for (const it of items) {
     const sel = it.selector || "";
-    if (sel && !seen.has(sel)) {
-      seen.add(sel);
-      out.push(it);
-    }
+    if (sel && !seen.has(sel)) { seen.add(sel); out.push(it); }
   }
   return out;
 }
-
 function compactClickableList(snapshot) {
   const raw = Array.isArray(snapshot?.buttons) ? snapshot.buttons : [];
   const shaped = raw
@@ -116,7 +110,7 @@ function compactClickableList(snapshot) {
   return deduped;
 }
 
-// Optional: background “SCOUT_URLS” previewer (CORS-safe HTML peek)
+// Optional: previewer
 async function scoutUrls(urls) {
   return new Promise((resolve) => {
     try {
@@ -130,15 +124,12 @@ async function scoutUrls(urls) {
 }
 
 /* ---------- Guided prompt helpers ---------- */
-let __lastFindData = null; // keep last find().data so we can suggest exact matches quickly
+let __lastFindData = null;
 
 function buildLocalGuidance({ page_state, lastFindData, thing }) {
-  const lines = [];
-  const add = (s = "") => lines.push(s);
-
+  const lines = []; const add = (s = "") => lines.push(s);
   add("I couldn’t decide the next action. Pick one of these or type your own instruction:\n");
 
-  // Prefer the most recent find() candidates
   const findMatches = (lastFindData?.matches || []).slice(0, 5);
   if (findMatches.length) {
     add("• From what I just searched:");
@@ -147,7 +138,6 @@ function buildLocalGuidance({ page_state, lastFindData, thing }) {
       add(`  ${i + 1}. Click “${txt}”`);
     });
   } else {
-    // Otherwise suggest the best on-page buttons
     const topButtons = compactClickableList(page_state).slice(0, 5);
     if (topButtons.length) {
       add("• Popular actions on this page:");
@@ -175,7 +165,6 @@ function buildLocalGuidance({ page_state, lastFindData, thing }) {
 }
 
 function buildAgentGuidanceText(info) {
-  // Render options/examples coming from the agent interrupt payload
   let guided = (info.prompt || "I need clarification to continue.");
   if (Array.isArray(info.options) && info.options.length) {
     guided += "\n\nOptions:\n";
@@ -240,7 +229,24 @@ async function onRun() {
     if (!res.ok) { log(`HTTP ${res.status} on /agent/run`); return; }
     const payload = await res.json();
     const msgs = payload?.messages || [];
-    log("<< turn response, messages=" + msgs.length);
+    log("<< turn response, messages=" + msgs.length + " :: " + msgs.map(m => m?.name || "(no name)").join(", "));
+
+    // 🔸 Handle human-in-the-loop interrupts sent by the backend
+    // runner.py returns ONLY this message when the graph calls interrupt(), with JSON content.
+    // (No EXECUTION_PLAN is returned in this case.)
+    const clarifyMsg = msgs.find(m => m?.name === "NEEDS_CLARIFICATION");
+    if (clarifyMsg) {
+      let info = {};
+      try { info = JSON.parse(clarifyMsg.content || "{}"); } catch {}
+      const promptText = buildAgentGuidanceText(info || {});
+      const reply = await askInline(promptText);
+      if (!reply) { log("Canceled. Stopping."); return; }
+      userReply = reply;     // send back on next /agent/run
+      lastTool = null;
+      lastObs = null;
+      hops++;                // advance to next turn
+      continue;              // skip executing steps on this turn
+    }
 
     const planMsg = msgs.find((m) => m.name === "EXECUTION_PLAN");
     const steps = planMsg?.content ? (JSON.parse(planMsg.content).steps || []) : [];
@@ -276,6 +282,10 @@ async function onRun() {
       lastTool = tool;
       lastObs = JSON.stringify(obs || {});
 
+      if (tool === "find" && obs?.ok) {
+        __lastFindData = obs.data || null;
+      }
+
       if (tool === "nav" || (obs?.ok && (obs.data?.navigating || obs.data?.href))) {
         navigated = true;
         await waitForTabNavigation(tab.id);
@@ -284,5 +294,6 @@ async function onRun() {
       }
     }
     hops++;
+    userReply = null; // make user replies one-shot
   }
 }
