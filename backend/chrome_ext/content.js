@@ -1,57 +1,81 @@
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+// content.js (clean)
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/* ────────────────────────────── Selectors & Snapshot ───────────────────────────── */
 
 function nodeToPath(el) {
-  if (!el) return null;
+  if (!el || el.nodeType !== 1) return null;
   if (el.id) return `#${CSS.escape(el.id)}`;
+
   const parts = [];
   let n = el;
+  // Keep paths reasonably short; prefer structure over brittleness
   while (n && n.nodeType === 1 && parts.length < 6) {
     const name = n.tagName.toLowerCase();
-    const idx = Array.from(n.parentElement?.children || []).indexOf(n) + 1;
+    const parent = n.parentElement;
+    if (!parent) {
+      parts.unshift(name);
+      break;
+    }
+    // nth-child is robust enough for our use; nth-of-type is sometimes over-specific for mixed UIs
+    const idx = Array.prototype.indexOf.call(parent.children, n) + 1;
     parts.unshift(`${name}:nth-child(${idx})`);
-    n = n.parentElement;
+    n = parent;
   }
   return parts.join(">");
 }
 
+function safeText(el) {
+  const t = (el?.innerText || el?.textContent || "").trim();
+  return t.replace(/\s+/g, " ");
+}
+
 function snapshot() {
-  const buttons = [...document.querySelectorAll("a,button,[role='button']")]
-    .slice(0, 400)
-    .map(b => ({
-      text: (b.innerText || "").trim().slice(0, 160),
-      selector: nodeToPath(b)
-    }));
+  const q = (sel, limit = 100) => Array.from(document.querySelectorAll(sel)).slice(0, limit);
 
-  const links = [...document.querySelectorAll("a[href]")]
-    .slice(0, 400)
-    .map(a => ({
-      text: (a.innerText || "").trim().slice(0, 200),
-      selector: nodeToPath(a),
-      href: a.href
-    }));
+  const buttons = q("a,button,[role='button']", 400).map((b) => ({
+    text: safeText(b).slice(0, 160),
+    selector: nodeToPath(b),
+  }));
 
-  const inputs = [...document.querySelectorAll("input,textarea,select")]
-    .slice(0, 200)
-    .map(i => ({
-      name: i.name || i.id || i.placeholder || i.getAttribute("aria-label") || "",
-      placeholder: i.placeholder || "",
-      ariaLabel: i.getAttribute("aria-label") || "",
-      selector: nodeToPath(i)
-    }));
+  const links = q("a[href]", 400).map((a) => ({
+    text: safeText(a).slice(0, 200),
+    selector: nodeToPath(a),
+    href: a.href,
+  }));
 
-  const raw_html = document.documentElement.outerHTML;
+  const inputs = q("input,textarea,select", 200).map((i) => ({
+    name:
+      i.name ||
+      i.id ||
+      i.placeholder ||
+      i.getAttribute("aria-label") ||
+      "",
+    placeholder: i.placeholder || "",
+    ariaLabel: i.getAttribute("aria-label") || "",
+    selector: nodeToPath(i),
+  }));
 
-  const nav_links = [...document.querySelectorAll('nav a,[role="navigation"] a')]
-    .slice(0, 200)
-    .map(a => ({ text: a.innerText.trim(), selector: nodeToPath(a), href: a.href }));
+  const nav_links = q('nav a,[role="navigation"] a', 200).map((a) => ({
+    text: safeText(a),
+    selector: nodeToPath(a),
+    href: a.href,
+  }));
 
-  const breadcrumbs = [...document.querySelectorAll('[aria-label*="breadcrumb" i] a')]
-    .slice(0, 20)
-    .map(a => ({ text: a.innerText.trim(), selector: nodeToPath(a), href: a.href }));
+  const breadcrumbs = q('[aria-label*="breadcrumb" i] a', 20).map((a) => ({
+    text: safeText(a),
+    selector: nodeToPath(a),
+    href: a.href,
+  }));
 
-  const headings = [...document.querySelectorAll('h1,h2,[role="heading"]')]
-    .slice(0, 50)
-    .map(h => ({ text: (h.innerText || "").trim().slice(0, 200), selector: nodeToPath(h) }));
+  const headings = q("h1,h2,[role='heading']", 50).map((h) => ({
+    text: safeText(h).slice(0, 200),
+    selector: nodeToPath(h),
+  }));
+
+  // Raw HTML can be large; retain for LLM context
+  const raw_html = document.documentElement?.outerHTML || "";
 
   return {
     url: location.href,
@@ -62,79 +86,133 @@ function snapshot() {
     nav_links,
     breadcrumbs,
     headings,
-    raw_html
+    raw_html,
   };
 }
 
+/* ────────────────────────────── Tools: find / click / type ─────────────────────── */
+
 function extractContains(q) {
   // supports a:contains('Text') or :contains("Text")
-  const m = q.match(/:contains\((['"])(.*?)\1\)/i);
+  const m = (q || "").match(/:contains\((['"])(.*?)\1\)/i);
   return m ? m[2] : null;
+}
+
+function textCandidates(el) {
+  const out = [];
+  const t = safeText(el);
+  if (t) out.push(t.toLowerCase());
+  const aria = (el.getAttribute?.("aria-label") || "").trim();
+  if (aria) out.push(aria.toLowerCase());
+  const title = (el.getAttribute?.("title") || "").trim();
+  if (title) out.push(title.toLowerCase());
+  return out;
 }
 
 async function findImpl({ query, max = 10 }) {
   const raw = (query || "").trim();
   const contains = extractContains(raw);
-  let textQuery = contains || raw.replace(/^a:/i, "").trim();
+  const textQuery = (contains || raw.replace(/^a:/i, "").trim()).toLowerCase();
 
-  const all = [...document.querySelectorAll("a,button,[role='button']")];
-  const scored = all
-    .map(el => {
-      const text = (el.innerText || "").trim();
-      let score = 0;
-      const t = text.toLowerCase();
-      const q = (textQuery || "").toLowerCase();
-      if (q && t.includes(q)) score += 10;
-      if (/appointment/.test(t)) score += 3; // tiny bias (kept from your original)
-      return { el, text, score };
-    })
-    .filter(x => x.score > 0);
+  if (!textQuery) return { matches: [], total: 0 };
 
-  scored.sort((a, b) => b.score - a.score);
+  const all = Array.from(document.querySelectorAll("a,button,[role='button']"));
+  const scored = [];
 
-  const top = scored.slice(0, max).map(x => ({
+  for (const el of all) {
+    const texts = textCandidates(el);
+    if (!texts.length) continue;
+
+    let score = 0;
+    for (const t of texts) {
+      if (t === textQuery) score += 20; // exact
+      if (t.includes(textQuery)) score += 10; // substring
+      if (t.startsWith(textQuery)) score += 3; // slight bias to prefix
+    }
+
+    // Domain-specific nudge (kept intentionally tiny)
+    const st = texts.join(" ");
+    if (/\bappointment\b/i.test(st)) score += 2;
+
+    if (score > 0) {
+      scored.push({ el, text: safeText(el), score });
+    }
+  }
+
+  scored.sort((a, b) => b.score - a.score || a.text.length - b.text.length);
+
+  const top = scored.slice(0, Math.max(1, Math.min(50, max))).map((x) => ({
     text: x.text,
     selector: nodeToPath(x.el),
-    href: (x.el.tagName === "A" && x.el.href) ? x.el.href : null
+    href: x.el.tagName === "A" ? x.el.href : null,
   }));
 
-  // Align with backend: {matches,total}
   return { matches: top, total: top.length };
 }
 
 function robustClick(el) {
-  try { el.scrollIntoView({ block: "center", inline: "center" }); } catch {}
+  if (!el || el.nodeType !== 1) return;
+  try {
+    el.scrollIntoView({ block: "center", inline: "center" });
+  } catch {}
   const rect = el.getBoundingClientRect();
   const cx = rect.left + Math.max(1, Math.min(rect.width / 2, rect.width - 1));
   const cy = rect.top + Math.max(1, Math.min(rect.height / 2, rect.height - 1));
+  // Fire a simple mouse sequence; el.click() as final fallback
   el.dispatchEvent(new MouseEvent("mousemove", { bubbles: true, clientX: cx, clientY: cy }));
   el.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, clientX: cx, clientY: cy, button: 0 }));
   el.dispatchEvent(new MouseEvent("mouseup",   { bubbles: true, clientX: cx, clientY: cy, button: 0 }));
-  el.click();
+  try { el.click(); } catch {}
 }
 
 async function clickImpl({ selector, text, query }) {
   let el = selector ? document.querySelector(selector) : null;
+
   if (!el && (text || query)) {
-    const needle = (text || query || "").toLowerCase();
-    el = [...document.querySelectorAll("a,button,[role='button']")]
-      .find(e => (e.innerText || "").trim().toLowerCase().includes(needle));
+    const needle = (text || query || "").toLowerCase().trim();
+    if (needle) {
+      el = Array.from(document.querySelectorAll("a,button,[role='button']"))
+        .find((e) => {
+          const t = safeText(e).toLowerCase();
+          const aria = (e.getAttribute?.("aria-label") || "").toLowerCase();
+          return t.includes(needle) || aria.includes(needle);
+        });
+    }
   }
+
   if (!el) {
-    // Include selector in error so the backend can detect "same selector failed twice"
     return { ok: false, selector: selector || null, error: "element not found" };
   }
+
+  // Avoid clicking disabled/hidden controls
+  const disabled = el.hasAttribute?.("disabled") || el.getAttribute?.("aria-disabled") === "true";
+  const style = window.getComputedStyle?.(el);
+  const hidden = style && (style.visibility === "hidden" || style.display === "none");
+  if (disabled || hidden) {
+    return { ok: false, selector: nodeToPath(el), error: "element disabled or hidden" };
+  }
+
   robustClick(el);
-  const href = (el.tagName === "A" && el.href) ? el.href : null;
-  // ⬇️ Return BOTH href and navigate_to so either field can be consumed upstream
-  return { ok: true, selector: nodeToPath(el), href, navigate_to: href, navigating: !!href };
+  const href = el.tagName === "A" ? (el.href || null) : null;
+
+  // If anchor opens in new tab, still return navigate_to to let the orchestrator handle navigation policy
+  const navigating = !!href;
+
+  return {
+    ok: true,
+    selector: nodeToPath(el),
+    href,
+    navigate_to: href,
+    navigating,
+  };
 }
 
 async function typeImpl({ selector, text, value }) {
-  // Accept both `text` (backend) and `value` (old callers)
-  const val = (text !== undefined) ? text : value;
-  const el = document.querySelector(selector);
+  const val = text !== undefined ? text : value;
+  const el = selector ? document.querySelector(selector) : null;
   if (!el) return { ok: false, selector, error: "input not found" };
+
+  // Focus & set value with input/change events
   el.focus();
   try { el.value = ""; el.dispatchEvent(new Event("input", { bubbles: true })); } catch {}
   try { el.value = val ?? ""; el.dispatchEvent(new Event("input", { bubbles: true })); } catch {}
@@ -142,9 +220,12 @@ async function typeImpl({ selector, text, value }) {
   return { ok: true, selector, typed: val ?? "" };
 }
 
+/* ────────────────────────────── Wait / Nav helpers ─────────────────────────── */
+
 async function waitForImpl({ selector, timeout = 15000 }) {
-  const t0 = performance.now();
-  while (performance.now() - t0 < timeout) {
+  if (!selector) return { ok: false, selector, error: "missing selector" };
+  const start = performance.now();
+  while (performance.now() - start < Math.max(0, timeout)) {
     const el = document.querySelector(selector);
     if (el) return { ok: true, selector };
     await sleep(200);
@@ -153,24 +234,25 @@ async function waitForImpl({ selector, timeout = 15000 }) {
 }
 
 async function navImpl({ url }) {
+  if (!url) return { navigating: null };
   location.href = url;
   return { navigating: url };
 }
 
 async function waitForLoadImpl({ timeout = 20000 }) {
-  const t0 = performance.now();
-  while (document.readyState !== "complete" && performance.now() - t0 < timeout) {
+  const start = performance.now();
+  while (document.readyState !== "complete" && performance.now() - start < Math.max(0, timeout)) {
     await sleep(100);
   }
   return { state: document.readyState, url: location.href };
 }
 
 async function waitForIdleImpl({ quietMs = 600, timeout = 8000 }) {
-  // crude "network idle": wait until DOM is complete and nothing changes for quietMs
-  const tEnd = performance.now() + timeout;
+  // crude "network idle": DOM complete + no innerHTML length changes for quietMs
+  const tEnd = performance.now() + Math.max(0, timeout);
   let last = document.body?.innerHTML?.length || 0;
   while (performance.now() < tEnd) {
-    await sleep(quietMs);
+    await sleep(Math.max(100, quietMs));
     const now = document.body?.innerHTML?.length || 0;
     if (document.readyState === "complete" && now === last) return { idle: true };
     last = now;
@@ -183,32 +265,32 @@ async function backImpl() {
   return { navigating: true };
 }
 
-// Optional: some models call "wait" with seconds; support seconds OR ms
+// Accept seconds or ms; clamp to <= 60s for safety
 async function waitImpl({ ms, seconds }) {
-  let durationMs = 0;
+  let durationMs = 500;
   if (typeof seconds === "number") {
     durationMs = Math.max(0, Math.min(60, seconds)) * 1000;
   } else if (typeof ms === "number") {
-    durationMs = ms;
-  } else {
-    durationMs = 500;
+    durationMs = Math.max(0, ms);
   }
   await sleep(durationMs);
   return { waited: durationMs };
 }
 
-const TOOL_IMPL = {
+/* ────────────────────────────── Tool Dispatch ─────────────────────────────── */
+
+const TOOL_IMPL = Object.freeze({
   get_page_state: async () => snapshot(),
   find: findImpl,
   click: clickImpl,
   type: typeImpl,
   wait_for: waitForImpl,
-  wait: waitImpl,              // accepts {seconds} or {ms}
+  wait: waitImpl, // accepts {seconds} or {ms}
   nav: navImpl,
   wait_for_load: waitForLoadImpl,
   wait_for_idle: waitForIdleImpl,
   back: backImpl,
-};
+});
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   (async () => {
@@ -218,26 +300,33 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         return;
       }
       if (msg?.type === "RUN_TOOL") {
-        const fn = TOOL_IMPL[msg.tool];
-        if (!fn) { sendResponse({ ok: false, data: { error: "unknown tool" } }); return; }
+        const tool = msg.tool;
+        const fn = TOOL_IMPL[tool];
+        if (!fn) {
+          sendResponse({ ok: false, data: { error: "unknown tool" } });
+          return;
+        }
         const data = await fn(msg.args || {});
-        // Normalize click/type/wait_for returns to { ok, data: {...} }
-        if (msg.tool === "click" || msg.tool === "type" || msg.tool === "wait_for") {
-          if (data && data.ok === false) { sendResponse({ ok: false, data }); return; }
+
+        // Normalize returns so the popup has a consistent {ok,data} envelope
+        if (tool === "click" || tool === "type" || tool === "wait_for") {
+          if (data && data.ok === false) {
+            sendResponse({ ok: false, data });
+            return;
+          }
           sendResponse({ ok: true, data });
           return;
         }
         sendResponse({ ok: true, data });
-      } else {
-        sendResponse({ ok: false, data: { error: "bad request" } });
+        return;
       }
+      sendResponse({ ok: false, data: { error: "bad request" } });
     } catch (e) {
-      // Include selector if present in args to help backend logs
       const sel = (msg?.args && (msg.args.selector || null)) || null;
       sendResponse({ ok: false, data: { selector: sel, error: e?.message || String(e) } });
     }
   })();
-  return true;
+  return true; // keep the message channel open for async
 });
 
 console.log("[content] loaded");

@@ -1,6 +1,5 @@
 // popup.js
 const API = "http://127.0.0.1:8001"; // FastAPI
-const THREAD_ID = crypto.randomUUID(); // Stable per popup session
 
 function log(m) {
   const el = document.getElementById("log");
@@ -17,57 +16,20 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("run").addEventListener("click", onRun);
 });
 
-/* ---------- Inline clarification prompt ---------- */
-function setBusyPrompting(busy) {
-  const btn = document.getElementById("run");
-  if (btn) btn.disabled = !!busy;
-}
-function askInline(promptText) {
-  return new Promise((resolve) => {
-    const box = document.getElementById("clarify");
-    const txt = document.getElementById("clarify-text");
-    const inp = document.getElementById("clarify-input");
-    const ok = document.getElementById("clarify-ok");
-    const cancel = document.getElementById("clarify-cancel");
-
-    txt.textContent = promptText || "What should I do next?";
-    inp.value = "";
-    box.style.display = "block";
-    inp.focus();
-    setBusyPrompting(true);
-
-    function cleanup(val) {
-      setBusyPrompting(false);
-      box.style.display = "none";
-      ok.removeEventListener("click", onOk);
-      cancel.removeEventListener("click", onCancel);
-      resolve(val);
-    }
-    function onOk() { cleanup(inp.value.trim()); }
-    function onCancel() { cleanup(null); }
-
-    ok.addEventListener("click", onOk);
-    cancel.addEventListener("click", onCancel);
-  });
-}
-
 /* ---------- Tab navigation helper ---------- */
 async function waitForTabNavigation(tabId, { timeout = 25000 } = {}) {
   return new Promise((resolve, reject) => {
     const start = Date.now();
-    function cleanup() {
-      chrome.tabs.onUpdated.removeListener(onUpdated);
-    }
     function onUpdated(id, info, tab) {
       if (id === tabId && info.status === "complete" && /^https?:\/\//.test(tab.url || "")) {
-        cleanup();
+        chrome.tabs.onUpdated.removeListener(onUpdated);
         resolve(tab);
       }
     }
     chrome.tabs.onUpdated.addListener(onUpdated);
     const timer = setInterval(() => {
       if (Date.now() - start > timeout) {
-        cleanup();
+        chrome.tabs.onUpdated.removeListener(onUpdated);
         clearInterval(timer);
         reject(new Error("Navigation timeout"));
       }
@@ -75,225 +37,84 @@ async function waitForTabNavigation(tabId, { timeout = 25000 } = {}) {
   });
 }
 
-/* ---------- Scoring/helpers for nice inline guidance (unchanged) ---------- */
-function scoreClickable(text) {
-  const t = (text || "").toLowerCase();
-  let s = 0;
-  if (!t) return s;
-  if (t.length <= 3) s -= 2;
-  if (t.includes("appointment")) s += 20;
-  if (t.includes("book")) s += 12;
-  if (t.includes("login") || t.includes("sign in")) s += 10;
-  if (t.includes("search")) s += 4;
-  if (t.includes("healthier sg")) s += 3;
-  if (t.includes("payments")) s += 3;
-  if (t.includes("results")) s += 2;
-  s += Math.min(6, Math.max(0, Math.floor((t.length - 8) / 10)));
-  return s;
-}
-function dedupeBySelector(items) {
-  const seen = new Set(); const out = [];
-  for (const it of items) {
-    const sel = it.selector || "";
-    if (sel && !seen.has(sel)) { seen.add(sel); out.push(it); }
-  }
-  return out;
-}
-function compactClickableList(snapshot) {
-  const raw = Array.isArray(snapshot?.buttons) ? snapshot.buttons : [];
-  const shaped = raw
-    .map(b => ({ text: (b.text || "").trim(), selector: b.selector || "" }))
-    .filter(b => b.selector && b.text)
-    .map(b => ({ ...b, score: scoreClickable(b.text) }));
-  const deduped = dedupeBySelector(shaped);
-  deduped.sort((a, b) => (b.score - a.score) || (a.selector.length - b.selector.length));
-  return deduped;
-}
-
-// Optional: previewer
-async function scoutUrls(urls) {
-  return new Promise((resolve) => {
-    try {
-      chrome.runtime.sendMessage({ type: "SCOUT_URLS", urls }, (resp) => {
-        resolve(resp?.data || []);
-      });
-    } catch {
-      resolve([]);
-    }
-  });
-}
-
-/* ---------- Guided prompt helpers ---------- */
-let __lastFindData = null;
-
-function buildLocalGuidance({ page_state, lastFindData, thing }) {
-  const lines = []; const add = (s = "") => lines.push(s);
-  add("I couldn’t decide the next action. Pick one of these or type your own instruction:\n");
-
-  const findMatches = (lastFindData?.matches || []).slice(0, 5);
-  if (findMatches.length) {
-    add("• From what I just searched:");
-    findMatches.forEach((m, i) => {
-      const txt = (m.text || "").trim().slice(0, 80) || "(unlabeled button/link)";
-      add(`  ${i + 1}. Click “${txt}”`);
-    });
-  } else {
-    const topButtons = compactClickableList(page_state).slice(0, 5);
-    if (topButtons.length) {
-      add("• Popular actions on this page:");
-      topButtons.forEach((b, i) => {
-        const txt = (b.text || "").trim().slice(0, 80);
-        add(`  ${i + 1}. Click “${txt}”`);
-      });
-    }
-  }
-
-  if (thing) {
-    add("\n• Goal-oriented suggestions:");
-    add(`  - Search again for: “${thing}”`);
-    add(`  - Try: “find a:contains('${thing}')”`);
-  }
-
-  add(
-    "\nReply with one of the numbers above (e.g., 1), or a command like:",
-    "  • click <exact label>",
-    "  • find <keywords>",
-    "  • type selector=<css> text=<value>"
-  );
-
-  return lines.join("\n");
-}
-
-function buildAgentGuidanceText(info) {
-  let guided = (info.prompt || "I need clarification to continue.");
-  if (Array.isArray(info.options) && info.options.length) {
-    guided += "\n\nOptions:\n";
-    for (const o of info.options) {
-      const n = typeof o.n === "number" ? o.n : "-";
-      const label = o.label || "(unlabeled)";
-      guided += `  ${n}. ${label}\n`;
-    }
-    if (Array.isArray(info.examples) && info.examples.length) {
-      guided += "\nTry: " + info.examples.map(x => `“${x}”`).join(", ");
-    }
-  }
-  return guided;
-}
-
-/* ---------- Main loop ---------- */
+/* ---------- Main loop (stateless) ---------- */
 async function onRun() {
   const tab = await getActiveTab();
   if (!tab) return log("No active tab");
+
+  // Always start from HealthHub home
   await chrome.tabs.update(tab.id, { url: "https://www.healthhub.sg/" });
-  await waitForTabNavigation(tab.id); 
+  await waitForTabNavigation(tab.id);
+
+  // Inject content tools
   await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ["content.js"] });
   if (!/^https?:\/\//.test(tab.url || "")) return log("Open a normal webpage first.");
 
-  await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ["content.js"] });
-
+  // Backend health check
   const h = await fetch(`${API}/health`).then(r => r.json()).catch(e => ({ error: String(e) }));
   log("health: " + JSON.stringify(h));
   if (!h || h.ok !== true) return log("Backend not healthy");
 
   const goal = (document.getElementById("goal")?.value || "Find the Book Appointment button").trim();
+  const runTool = (tool, args) => chrome.tabs.sendMessage(tab.id, { type: "RUN_TOOL", tool, args });
 
-  const runTool = (tool, args) =>
-    chrome.tabs.sendMessage(tab.id, { type: "RUN_TOOL", tool, args });
+  // 1) Snapshot for context
+  const snap = await runTool("get_page_state", {});
+  if (!snap?.ok) { log("snapshot failed: " + JSON.stringify(snap)); return; }
+  const page_state = snap.data;
+  log(`Snapshot: url=${page_state.url} buttons=${(page_state.buttons || []).length} links=${(page_state.links || []).length}`);
+  log(`Sending to backend (one-shot): current_url=${page_state.url}`);
 
-  let hops = 0;
-  let finished = false;
-  let userReply = null;
-  let lastTool = null;
-  let lastObs = null;
-
-  while (hops < 12 && !finished) {
-    const snap = await runTool("get_page_state", {});
-    if (!snap?.ok) { log("snapshot failed: " + JSON.stringify(snap)); return; }
-    const page_state = snap.data;
-    log(`Snapshot: url=${page_state.url} buttons=${(page_state.buttons || []).length} links=${(page_state.links || []).length}`);
-
-    const body = {
+  // 2) Request plan (stateless)
+  const planRes = await fetch(`${API}/agent/run`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
       goal,
       page_state,
-      thread_id: THREAD_ID,
-      ...(userReply ? { user_reply: userReply } : {}),
-      ...(lastTool ? { last_tool: lastTool } : {}),
-      ...(lastObs ? { last_obs: lastObs } : {}),
-    };
-    log(">> POST /agent/run (turn=" + (hops + 1) + ")");
-    const res = await fetch(`${API}/agent/run`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body)
-    });
-    if (!res.ok) { log(`HTTP ${res.status} on /agent/run`); return; }
-    const payload = await res.json();
-    const msgs = payload?.messages || [];
-    log("<< turn response, messages=" + msgs.length + " :: " + msgs.map(m => m?.name || "(no name)").join(", "));
+      current_url: page_state.url
+    })
+  });
+  if (!planRes.ok) { log(`HTTP ${planRes.status} on /agent/run`); return; }
 
-    // 🔸 Handle human-in-the-loop interrupts sent by the backend
-    // runner.py returns ONLY this message when the graph calls interrupt(), with JSON content.
-    // (No EXECUTION_PLAN is returned in this case.)
-    const clarifyMsg = msgs.find(m => m?.name === "NEEDS_CLARIFICATION");
-    if (clarifyMsg) {
-      let info = {};
-      try { info = JSON.parse(clarifyMsg.content || "{}"); } catch {}
-      const promptText = buildAgentGuidanceText(info || {});
-      const reply = await askInline(promptText);
-      if (!reply) { log("Canceled. Stopping."); return; }
-      userReply = reply;     // send back on next /agent/run
-      lastTool = null;
-      lastObs = null;
-      hops++;                // advance to next turn
-      continue;              // skip executing steps on this turn
+  const planPayload = await planRes.json();
+  const steps = Array.isArray(planPayload?.steps) ? planPayload.steps : [];
+  const hint = planPayload?.hint || {};
+  log(`Plan received: ${steps.length} steps`);
+
+  // 3) Execute steps locally
+  for (const step of steps) {
+    const { tool, args } = step || {};
+    if (!tool) continue;
+
+    if (tool === "done" || tool === "fail") {
+      log(`** ${tool.toUpperCase()}: ${JSON.stringify(args || {})}`);
+      break;
     }
 
-    const planMsg = msgs.find((m) => m.name === "EXECUTION_PLAN");
-    const steps = planMsg?.content ? (JSON.parse(planMsg.content).steps || []) : [];
-    log(`EXECUTION_PLAN: ${steps.length} step(s)`);
+    // Support optional alias
+    const execTool = (tool === "goto") ? "nav" : tool;
+    log(`>> RUN_TOOL ${execTool} ${JSON.stringify(args || {})}`);
+    const obs = await runTool(execTool, args || {});
+    log(`.. OBS ${execTool}: ${JSON.stringify(obs || {})}`);
 
-    let navigated = false;
-    for (const step of steps) {
-      const { tool, args } = step || {};
-      if (!tool) continue;
-
-      if (tool === "done" || tool === "fail") {
-        log(`** ${tool.toUpperCase()}: ${JSON.stringify(args || {})}`);
-        finished = true;
-        break;
-      }
-
-      if (tool === "goto") {
-        log(`>> RUN_TOOL nav ${JSON.stringify(args || {})}`);
-        const navObs = await runTool("nav", args || {});
-        log(`.. OBS nav: ${JSON.stringify(navObs || {})}`);
-        lastTool = "nav";
-        lastObs = JSON.stringify(navObs || {});
-        navigated = true;
-
-        await waitForTabNavigation(tab.id);
-        await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ["content.js"] });
-        break;
-      }
-
-      log(`>> RUN_TOOL ${tool} ${JSON.stringify(args || {})}`);
-      const obs = await runTool(tool, args || {});
-      log(`.. OBS ${tool}: ${JSON.stringify(obs || {})}`);
-      lastTool = tool;
-      lastObs = JSON.stringify(obs || {});
-
-      if (tool === "find" && obs?.ok) {
-        __lastFindData = obs.data || null;
-      }
-
-      if (tool === "nav" || (obs?.ok && (obs.data?.navigating || obs.data?.href))) {
-        navigated = true;
-        await waitForTabNavigation(tab.id);
-        await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ["content.js"] });
-        break;
-      }
+    // If navigation occurred, wait, re-inject tools, and let page settle
+    const navigated = (execTool === "nav") || (obs?.ok && (obs.data?.navigating || obs.data?.href));
+    if (navigated) {
+      await waitForTabNavigation(tab.id);
+      await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ["content.js"] });
+      await runTool("wait_for_idle", { quietMs: 600, timeout: 6000 });
     }
-    hops++;
-    userReply = null; // make user replies one-shot
+  }
+
+  // 4) Optional arrival verification
+  const snap2 = await runTool("get_page_state", {});
+  if (snap2?.ok) {
+    const url = (snap2.data?.url || "").toLowerCase();
+    if (hint?.expect_path && url.includes(hint.expect_path)) {
+      log(`** DONE: Arrived at ${hint.expect_path}`);
+    } else if (hint?.summary) {
+      log(`** SUMMARY: ${hint.summary}`);
+    }
   }
 }

@@ -5,7 +5,6 @@ from typing import TypedDict, Annotated, List, Optional
 
 from langgraph.graph import StateGraph, START, END
 from langgraph.prebuilt import ToolNode, tools_condition
-from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph.message import add_messages
 from langchain_core.messages import AnyMessage, HumanMessage, AIMessage, ToolMessage
 
@@ -16,19 +15,17 @@ from .tools import build_tools
 from .adapter import as_tool_call_ai_message
 from .utils import safe_excerpt, norm_text
 
-MAX_ITERATIONS = 10
-CHECKPOINTER = MemorySaver()
+MAX_ITERATIONS = 6  # keep plans tight
 
 
 class AgentState(TypedDict):
     messages: Annotated[List[AnyMessage], add_messages]
     iteration_count: int
-    feedback_required: bool
-    pending_options: Optional[List[dict]]
 
 
+# ────────────────────────── helpers ──────────────────────────────────────────
 def _build_page_vocab(page: dict, max_items: int = 80) -> List[str]:
-    """Local page vocab builder to keep this module decoupled from normalizer."""
+    """Lightweight page vocab; keeps module decoupled from normalizer."""
     seen, out = set(), []
 
     def add(txt: Optional[str]):
@@ -43,7 +40,6 @@ def _build_page_vocab(page: dict, max_items: int = 80) -> List[str]:
 
     for item in (page.get("clickables_preview") or []):
         add(item.get("text"))
-
     for b in (page.get("buttons") or []):
         add(b.get("text"))
     for a in (page.get("links") or []):
@@ -64,13 +60,29 @@ def _build_page_vocab(page: dict, max_items: int = 80) -> List[str]:
     return out[:max_items]
 
 
+def _ai_tool_call(name: str, args: dict) -> AIMessage:
+    return AIMessage(
+        content="",
+        tool_calls=[{
+            "id": f"call_{name}_{uuid.uuid4().hex[:6]}",
+            "type": "tool_call",
+            "name": name,
+            "args": args or {},
+        }],
+    )
+
+
+def _done(reason: str) -> AIMessage:
+    return _ai_tool_call("done", {"reason": reason or "Stopped."})
+
+
+# ────────────────────────── graph builder ────────────────────────────────────
 def build_app_for_page(page: dict):
     """
-    Minimal agent graph that ALWAYS follows one of four workflows:
-      - appointments | lab_results | payments | immunisations
-
-    The routing + plan are produced upstream by llm_normalize_goal(), which rewrites
-    the user's GOAL to a deterministic tool plan (find→click→[wait]→find→click→done).
+    Stateless, turn-free agent:
+      - Normalizes arbitrary GOAL to one of four rails via llm_normalize_goal().
+      - Executes strictly via tools (find → click → wait/type as needed).
+      - On ambiguity/error: stops with done(reason) — no user clarification mid-run.
     """
     llm = make_llm(temperature=0)
     tools = build_tools(page)
@@ -79,41 +91,14 @@ def build_app_for_page(page: dict):
 
     def _ensure_defaults(state: AgentState) -> AgentState:
         state.setdefault("iteration_count", 0)
-        state.setdefault("feedback_required", False)
         state.setdefault("messages", [])
-        state.setdefault("pending_options", None)
         return state
 
-    def _auto_click(selector: str, state: AgentState) -> AgentState:
-        return {
-            **state,
-            "messages": [AIMessage(content="", tool_calls=[{
-                "id": f"call_click_{uuid.uuid4().hex[:6]}",
-                "type": "tool_call",
-                "name": "click",
-                "args": {"selector": selector},
-            }])]
-        }
-
-    def _ask_user(prompt: str, state: AgentState, options: Optional[List[dict]] = None, examples: Optional[List[str]] = None) -> AgentState:
-        # langgraph interrupt for human-in-the-loop
-        from langgraph.types import interrupt  # local import keeps top clean
-        payload = {"awaiting_user": True, "prompt": prompt}
-        if options is not None:
-            payload["options"] = options
-        if examples is not None:
-            payload["examples"] = examples
-        interrupt(json.dumps(payload))
-        state["feedback_required"] = True
-        return state
-
-    # ── Nodes ─────────────────────────────────────────────────────────────────
-
+    # ── Nodes ────────────────────────────────────────────────────────────────
     def normalize_node(state: AgentState) -> AgentState:
         """
-        Rewrite any GOAL to a canonical four-path plan via llm_normalize_goal().
-        Example output (appointments):
-          find('Appointments') then click the best match, then wait(600), find('Book Appointment') ...
+        Rewrite GOAL into a canonical four-path plan (appointments/lab_results/payments/immunisations).
+        Example plan: "find('Appointments') then click the best match, then wait(600), then find('Book Appointment')..."
         """
         state = _ensure_defaults(state)
         if not state["messages"]:
@@ -124,7 +109,6 @@ def build_app_for_page(page: dict):
             if isinstance(msg, HumanMessage) and isinstance(msg.content, str) and msg.content.startswith("GOAL:"):
                 raw_goal = msg.content[len("GOAL:"):].strip()
                 canon = llm_normalize_goal(raw_goal, page_vocab)
-                # If for any reason normalizer returns None, default to appointments entry
                 plan = canon or "find('appointments') then click the best match, then done"
                 new_msgs[i] = HumanMessage(f"GOAL: {plan}")
                 break
@@ -133,71 +117,53 @@ def build_app_for_page(page: dict):
 
     def agent_node(state: AgentState) -> AgentState:
         """
-        Execute the plan strictly via tool calls.
-        - On find(): if 0 matches → ask user; if 1 match → auto-click; else show options.
-        - On click(): continue; if click fails → ask user.
-        - Stop on 'done'.
+        Deterministic execution with no human-in-the-loop:
+          - find(): 0 → done; ≥1 → auto-pick first with selector.
+          - click(): if ok=False → done(reason).
+          - stop on 'done'.
         """
         state = _ensure_defaults(state)
-
-        # Resume after human feedback
-        if state.get("feedback_required"):
-            ans_msg = next((m for m in reversed(state["messages"]) if isinstance(m, HumanMessage)), None)
-            if ans_msg:
-                ans = (ans_msg.content or "").strip()
-                opts = state.get("pending_options") or []
-                chosen = None
-                if ans.isdigit() and opts:
-                    idx = int(ans) - 1
-                    if 0 <= idx < len(opts):
-                        chosen = opts[idx]
-                if chosen and chosen.get("selector"):
-                    state["feedback_required"] = False
-                    state["pending_options"] = None
-                    return _auto_click(chosen["selector"], state)
-                return _ask_user("I couldn't match your reply to an option.", state, options=opts)
-            return _ask_user("Still waiting for your choice.", state, options=state.get("pending_options") or [])
-
         state["iteration_count"] += 1
 
-        # Handle tool results
+        # Handle tool observations
         if state["messages"] and isinstance(state["messages"][-1], ToolMessage):
             last = state["messages"][-1]
-            last_name = (getattr(last, "name", "") or "").lower()
+            name = (getattr(last, "name", "") or "").lower()
 
-            if last_name == "done":
+            if name == "done":
+                # Terminal; emit a short acknowledgment so planner can summarize
                 return {**state, "messages": [AIMessage(content="✅ Finished.")]}
 
-            if last_name == "find":
+            # Standardize payload shape
+            try:
                 payload = json.loads(last.content or "{}")
-                payload = payload.get("data", payload)
-                total = int(payload.get("total", 0))
-                matches = payload.get("matches", []) or []
+            except Exception:
+                payload = {}
+            data = payload.get("data", payload) or {}
 
+            if name == "find":
+                total = int(data.get("total", 0))
+                matches = data.get("matches", []) or []
                 if total <= 0:
-                    return _ask_user("I couldn't find anything. What should I search or click instead?", state)
+                    return {**state, "messages": [_done("No matching elements were found.")]}
 
-                if total == 1 and matches[0].get("selector"):
-                    return _auto_click(matches[0]["selector"], state)
+                # Prefer first with a usable selector
+                first = next((m for m in matches if m.get("selector")), None)
+                if not first:
+                    return {**state, "messages": [_done("Matches lacked usable selectors.")]}
+                return {**state, "messages": [_ai_tool_call("click", {"selector": first["selector"]})]}
 
-                # Multiple options → ask user to pick
-                opts = [{"n": i + 1,
-                         "label": (m.get("text") or "").strip(),
-                         "selector": m.get("selector") or ""} for i, m in enumerate(matches[:6])]
-                state["pending_options"] = opts
-                return _ask_user("I found several matches. Please pick a number or type a command.", state, options=opts)
+            if name == "click":
+                if not data.get("ok", True):
+                    sel = data.get("selector") or ""
+                    return {**state, "messages": [_done(f"Click failed for '{sel}'.")]}
+                # Successful click: LLM will choose next step from schema hint below
 
-            if last_name == "click":
-                payload = json.loads(last.content or "{}")
-                payload = payload.get("data", payload)
-                if not payload.get("ok", True):
-                    sel = payload.get("selector") or ""
-                    return _ask_user(f"Click failed for '{sel}'. What should I click instead?", state)
-
+        # Safety cap
         if state["iteration_count"] >= MAX_ITERATIONS:
-            return _ask_user("I've tried multiple steps. Please guide me on the exact next action.", state)
+            return {**state, "messages": [_done("Max steps reached.")]}
 
-        # Normal LLM step: generate the next tool call following the canonical plan
+        # Ask LLM for the next tool call following the normalized plan
         raw_html_excerpt = safe_excerpt(page.get("raw_html", ""), max_chars=400) if isinstance(page.get("raw_html"), str) else ""
         page_context = {
             "url": page.get("url"),
@@ -212,21 +178,23 @@ def build_app_for_page(page: dict):
             "samples": {"buttons": page.get("buttons", [])[:12], "inputs": page.get("inputs", [])[:8]},
             "raw_html_excerpt": raw_html_excerpt,
         }
+
         messages = state["messages"] + [
             HumanMessage(f"PAGE_CONTEXT_JSON: {json.dumps(page_context, ensure_ascii=False)}"),
-            HumanMessage(SCHEMA_HINT),
+            HumanMessage(SCHEMA_HINT),  # strict schema: emit ONE tool call JSON (find/click/type/wait/done)
         ]
         resp = llm.invoke(messages)
         ai_msg = as_tool_call_ai_message(resp.content, allowed)
+
         return {**state, "messages": [ai_msg]}
 
     def after_tools(state: AgentState):
         last = state["messages"][-1]
-        if isinstance(last, ToolMessage) and (getattr(last, "name", "").lower() in ("done",)):
+        if isinstance(last, ToolMessage) and (getattr(last, "name", "").lower() == "done"):
             return END
         return "agent"
 
-    # ── Graph wiring ──────────────────────────────────────────────────────────
+    # ── Wiring ───────────────────────────────────────────────────────────────
     g = StateGraph(AgentState)
     g.add_node("normalize", normalize_node)
     g.add_node("agent", agent_node)
@@ -237,4 +205,5 @@ def build_app_for_page(page: dict):
     g.add_conditional_edges("agent", tools_condition, {"tools": "tools", END: END})
     g.add_conditional_edges("tools", after_tools, {"agent": "agent", END: END})
 
-    return g.compile(checkpointer=CHECKPOINTER)
+    # No checkpointer: truly stateless per request
+    return g.compile()
