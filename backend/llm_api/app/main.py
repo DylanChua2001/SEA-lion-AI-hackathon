@@ -3,6 +3,7 @@ import os
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from app.tools import set_latest_snapshot
 
 from .schemas import AgentRunRequest, AgentPlanResponse
 from .runner import run_plan_once
@@ -35,3 +36,8 @@ async def agent_run(req: AgentRunRequest) -> AgentPlanResponse:
     plan = run_plan_once(goal=req.goal, page_state=req.page_state)
     # plan already matches AgentPlanResponse schema
     return AgentPlanResponse(**plan)
+
+@app.post("/bridge/snapshot")
+async def bridge_snapshot(payload: dict):
+    set_latest_snapshot(payload)
+    return {"ok": True}

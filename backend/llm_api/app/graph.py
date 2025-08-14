@@ -8,12 +8,13 @@ from langgraph.prebuilt import ToolNode, tools_condition
 from langgraph.graph.message import add_messages
 from langchain_core.messages import AnyMessage, HumanMessage, AIMessage, ToolMessage
 
-from .llm import make_llm
-from .config import SCHEMA_HINT
-from .normalizer import llm_normalize_goal
-from .tools import build_tools
-from .adapter import as_tool_call_ai_message
-from .utils import safe_excerpt, norm_text
+from app.llm import make_llm
+from app.config import SCHEMA_HINT
+from app.normalizer import llm_normalize_goal
+from app.tools import build_tools
+from app.adapter import as_tool_call_ai_message
+from app.utils import safe_excerpt, norm_text
+from app.subgraphs.lab_records import build_lab_records_subgraph  # absolute import
 
 MAX_ITERATIONS = 6  # keep plans tight
 
@@ -21,6 +22,8 @@ MAX_ITERATIONS = 6  # keep plans tight
 class AgentState(TypedDict):
     messages: Annotated[List[AnyMessage], add_messages]
     iteration_count: int
+    lab_needed: bool
+    lab_started: bool
 
 
 # ────────────────────────── helpers ──────────────────────────────────────────
@@ -82,23 +85,29 @@ def build_app_for_page(page: dict):
     Stateless, turn-free agent:
       - Normalizes arbitrary GOAL to one of four rails via llm_normalize_goal().
       - Executes strictly via tools (find → click → wait/type as needed).
-      - On ambiguity/error: stops with done(reason) — no user clarification mid-run.
+      - On ambiguity/error: stops with done(reason).
+      - After navigating to the Lab Results page, automatically runs the Lab Records subgraph once.
     """
     llm = make_llm(temperature=0)
     tools = build_tools(page)
     allowed = {t.name for t in tools}
     page_vocab = _build_page_vocab(page)
 
+    # Build the Lab Records subgraph for this page
+    lab_graph = build_lab_records_subgraph(page)
+
     def _ensure_defaults(state: AgentState) -> AgentState:
         state.setdefault("iteration_count", 0)
         state.setdefault("messages", [])
+        state.setdefault("lab_needed", False)
+        state.setdefault("lab_started", False)
         return state
 
     # ── Nodes ────────────────────────────────────────────────────────────────
     def normalize_node(state: AgentState) -> AgentState:
         """
-        Rewrite GOAL into a canonical four-path plan (appointments/lab_results/payments/immunisations).
-        Example plan: "find('Appointments') then click the best match, then wait(600), then find('Book Appointment')..."
+        Rewrite GOAL into a canonical plan (appointments/lab_results/payments/immunisations).
+        NOTE: We do NOT set lab_needed here; we only set it after a click to the Lab URL.
         """
         state = _ensure_defaults(state)
         if not state["messages"]:
@@ -119,7 +128,7 @@ def build_app_for_page(page: dict):
         """
         Deterministic execution with no human-in-the-loop:
           - find(): 0 → done; ≥1 → auto-pick first with selector.
-          - click(): if ok=False → done(reason).
+          - click(): if ok=False → done(reason); if href is Lab page → mark lab_needed and yield wait(0).
           - stop on 'done'.
         """
         state = _ensure_defaults(state)
@@ -131,7 +140,7 @@ def build_app_for_page(page: dict):
             name = (getattr(last, "name", "") or "").lower()
 
             if name == "done":
-                # Terminal; emit a short acknowledgment so planner can summarize
+                # Terminal; emit a short acknowledgment (the router will handle subgraph handoff).
                 return {**state, "messages": [AIMessage(content="✅ Finished.")]}
 
             # Standardize payload shape
@@ -151,13 +160,22 @@ def build_app_for_page(page: dict):
                 first = next((m for m in matches if m.get("selector")), None)
                 if not first:
                     return {**state, "messages": [_done("Matches lacked usable selectors.")]}
+
                 return {**state, "messages": [_ai_tool_call("click", {"selector": first["selector"]})]}
 
             if name == "click":
                 if not data.get("ok", True):
                     sel = data.get("selector") or ""
                     return {**state, "messages": [_done(f"Click failed for '{sel}'.")]}
-                # Successful click: LLM will choose next step from schema hint below
+
+                # Detect Lab destination and set gate for subgraph
+                href = (data.get("href") or data.get("navigate_to") or "")
+                if isinstance(href, str) and "/lab-test-reports/lab" in href.lower():
+                    state["lab_needed"] = True
+                    # Yield a no-op to let router transition to subgraph cleanly
+                    return {**state, "messages": [_ai_tool_call("wait", {"seconds": 0})]}
+
+                # Otherwise, normal flow continues (LLM decides next tool)
 
         # Safety cap
         if state["iteration_count"] >= MAX_ITERATIONS:
@@ -189,21 +207,49 @@ def build_app_for_page(page: dict):
         return {**state, "messages": [ai_msg]}
 
     def after_tools(state: AgentState):
+        """
+        Router after each tool result:
+          - If lab is needed and not started, jump to 'mark_lab' (then into the subgraph),
+            even if a 'done' was produced by the main agent.
+          - Otherwise, if we see a terminal 'done', end.
+          - Else continue the main agent loop.
+        """
+        state = _ensure_defaults(state)
+
+        if state.get("lab_needed") and not state.get("lab_started"):
+            return "mark_lab"
+
         last = state["messages"][-1]
         if isinstance(last, ToolMessage) and (getattr(last, "name", "").lower() == "done"):
             return END
         return "agent"
+
+    # flips the flag exactly once before subgraph hand-off
+    def mark_lab(state: AgentState) -> AgentState:
+        s = _ensure_defaults(state)
+        s["lab_started"] = True
+        return s
 
     # ── Wiring ───────────────────────────────────────────────────────────────
     g = StateGraph(AgentState)
     g.add_node("normalize", normalize_node)
     g.add_node("agent", agent_node)
     g.add_node("tools", ToolNode(tools))
+    g.add_node("mark_lab", mark_lab)
+    g.add_node("lab_records", lab_graph)
 
+    # main flow
     g.add_edge(START, "normalize")
     g.add_edge("normalize", "agent")
     g.add_conditional_edges("agent", tools_condition, {"tools": "tools", END: END})
-    g.add_conditional_edges("tools", after_tools, {"agent": "agent", END: END})
+    g.add_conditional_edges("tools", after_tools, {
+        "agent": "agent",
+        "mark_lab": "mark_lab",
+        END: END
+    })
+
+    # after marking, jump into subgraph
+    g.add_edge("mark_lab", "lab_records")
 
     # No checkpointer: truly stateless per request
     return g.compile()
