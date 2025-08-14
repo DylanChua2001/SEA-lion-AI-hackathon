@@ -16,20 +16,66 @@ from langchain_core.tools import StructuredTool
 # endpoint which calls set_latest_snapshot(). Graph tools can then read it.
 
 _BRIDGE_LOCK = threading.Lock()
+# Store as a dict with {"snap": <snapshot dict>, "ts": <float>} to support
+# sticky upgrades and prevent lower-quality pages from overwriting better ones.
 _LATEST_SNAPSHOT: Optional[Dict[str, Any]] = None
 
 
+def _rank_url(url: Optional[str]) -> int:
+    """Higher rank is 'better'. Prefer specific Lab page over generic Home."""
+    u = (url or "").lower()
+    if "/lab-test-reports/lab" in u:
+        return 3
+    if "eservices.healthhub.sg" in u:
+        return 2
+    if "healthhub.sg" in u:
+        return 1
+    return 0
+
+
 def set_latest_snapshot(snap: Dict[str, Any]) -> None:
-    """Server endpoint calls this to publish the newest browser snapshot."""
+    """Server endpoint calls this to publish the newest browser snapshot.
+
+    Sticky upgrade policy:
+      - Accept if the new snapshot is *newer in time* AND not a downgrade in rank.
+      - Otherwise keep the existing one.
+    """
     global _LATEST_SNAPSHOT
+    now = time.time()
+    new_url = (snap or {}).get("url")
+    new_rank = _rank_url(new_url)
+
     with _BRIDGE_LOCK:
-        _LATEST_SNAPSHOT = snap
+        prev = _LATEST_SNAPSHOT or {}
+        prev_snap = prev.get("snap") or {}
+        prev_ts = float(prev.get("ts") or 0)
+        prev_url = prev_snap.get("url")
+        prev_rank = _rank_url(prev_url)
+
+        accept = (now >= prev_ts) and (new_rank >= prev_rank)
+        if accept:
+            _LATEST_SNAPSHOT = {"snap": snap, "ts": now}
+            try:
+                print(f"[bridge] ACCEPT {new_url} (rank {new_rank}) ts={now}")
+            except Exception:
+                pass
+        else:
+            try:
+                print(
+                    f"[bridge] DROP   {new_url} (rank {new_rank}) ts={now}  — kept {prev_url} "
+                    f"(rank {prev_rank}) ts={prev_ts}"
+                )
+            except Exception:
+                pass
 
 
 def get_latest_snapshot() -> Optional[Dict[str, Any]]:
     with _BRIDGE_LOCK:
-        # return a shallow copy to avoid accidental mutation
-        return _LATEST_SNAPSHOT.copy() if _LATEST_SNAPSHOT else None
+        if not _LATEST_SNAPSHOT:
+            return None
+        # return a shallow copy to avoid accidental mutation by callers
+        snap = _LATEST_SNAPSHOT.get("snap") or {}
+        return snap.copy()
 
 
 # ────────────────────────── Tool factory ─────────────────────────────────────
@@ -172,9 +218,8 @@ def build_tools(page: Dict[str, Any]) -> List[StructuredTool]:
         """
         snap = get_latest_snapshot() or page or {}
         try:
-            print("[get_page_state]",
-                "bridge" if get_latest_snapshot() else "fallback",
-                (snap.get("url") or "")[:120])
+            src = "bridge" if get_latest_snapshot() else "fallback"
+            print(f"[get_page_state] {src} {snap.get('url')}")
         except Exception:
             pass
         return json.dumps(snap)

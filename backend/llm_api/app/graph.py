@@ -1,67 +1,31 @@
 # app/graph.py
 import json
 import uuid
-from typing import TypedDict, Annotated, List, Optional
+from typing import Annotated, Dict, Any, List, Optional, TypedDict
 
 from langgraph.graph import StateGraph, START, END
 from langgraph.prebuilt import ToolNode, tools_condition
 from langgraph.graph.message import add_messages
-from langchain_core.messages import AnyMessage, HumanMessage, AIMessage, ToolMessage
+from langchain_core.messages import AnyMessage, HumanMessage, AIMessage, ToolMessage, SystemMessage
 
-from app.llm import make_llm
-from app.config import SCHEMA_HINT
-from app.normalizer import llm_normalize_goal
 from app.tools import build_tools
+from app.llm import make_llm
 from app.adapter import as_tool_call_ai_message
-from app.utils import safe_excerpt, norm_text
-from app.subgraphs.lab_records import build_lab_records_subgraph  # absolute import
+from app.subgraphs.lab_records import build_lab_records_subgraph
 
-MAX_ITERATIONS = 6  # keep plans tight
-
+MAX_ITERATIONS = 12          # headroom for main loop
+LAB_PREP_MAX_TRIES = 8       # how many times to poll snapshot after click
+LAB_WAIT_MS = 600            # between polls
+LAB_IDLE = {"quietMs": 900, "timeout": 9000}  # initial idle after nav
 
 class AgentState(TypedDict):
     messages: Annotated[List[AnyMessage], add_messages]
     iteration_count: int
-    lab_needed: bool
-    lab_started: bool
-
-
-# ────────────────────────── helpers ──────────────────────────────────────────
-def _build_page_vocab(page: dict, max_items: int = 80) -> List[str]:
-    """Lightweight page vocab; keeps module decoupled from normalizer."""
-    seen, out = set(), []
-
-    def add(txt: Optional[str]):
-        t = norm_text(txt)
-        if not t:
-            return
-        k = t.lower()
-        if k in seen:
-            return
-        seen.add(k)
-        out.append(t)
-
-    for item in (page.get("clickables_preview") or []):
-        add(item.get("text"))
-    for b in (page.get("buttons") or []):
-        add(b.get("text"))
-    for a in (page.get("links") or []):
-        add(a.get("text"))
-    for i in (page.get("inputs") or []):
-        add(i.get("name") or i.get("placeholder"))
-
-    raw = page.get("raw_html") or ""
-    if isinstance(raw, str) and raw:
-        import re
-        for m in re.finditer(r'<a\b[^>]*>(.*?)</a\s*>', raw, flags=re.I | re.S):
-            add(re.sub(r'<[^>]+>', '', m.group(1)))
-        for m in re.finditer(r'<button\b[^>]*>(.*?)</button\s*>', raw, flags=re.I | re.S):
-            add(re.sub(r'<[^>]+>', '', m.group(1)))
-        for m in re.finditer(r'(?:aria-label|placeholder|alt)\s*=\s*["\']([^"\']{2,80})["\']', raw, flags=re.I):
-            add(m.group(1))
-
-    return out[:max_items]
-
+    lab_prep: bool               # we clicked Lab and are prepping snapshots
+    lab_prep_tries: int
+    lab_ready: bool              # snapshot ready to hand off
+    # (optional) you could stash the compact snapshot here if you want:
+    # lab_snapshot: Dict[str, Any]
 
 def _ai_tool_call(name: str, args: dict) -> AIMessage:
     return AIMessage(
@@ -74,182 +38,124 @@ def _ai_tool_call(name: str, args: dict) -> AIMessage:
         }],
     )
 
-
 def _done(reason: str) -> AIMessage:
-    return _ai_tool_call("done", {"reason": reason or "Stopped."})
+    return _ai_tool_call("done", {"reason": reason})
 
+def _is_lab_url(url: Optional[str]) -> bool:
+    return isinstance(url, str) and "/lab-test-reports/lab" in url.lower()
 
-# ────────────────────────── graph builder ────────────────────────────────────
+def _ready_enough(snap: Dict[str, Any]) -> bool:
+    if not snap or not isinstance(snap, dict):
+        return False
+    if not _is_lab_url(snap.get("url")):
+        return False
+    links = snap.get("links") or []
+    headings = snap.get("headings") or []
+    return (len(headings) >= 1) and (len(links) >= 5)
+
 def build_app_for_page(page: dict):
-    """
-    Stateless, turn-free agent:
-      - Normalizes arbitrary GOAL to one of four rails via llm_normalize_goal().
-      - Executes strictly via tools (find → click → wait/type as needed).
-      - On ambiguity/error: stops with done(reason).
-      - After navigating to the Lab Results page, automatically runs the Lab Records subgraph once.
-    """
     llm = make_llm(temperature=0)
-    tools = build_tools(page)
-    allowed = {t.name for t in tools}
-    page_vocab = _build_page_vocab(page)
 
-    # Build the Lab Records subgraph for this page
+    # Build all tools (so ToolNode can execute any), but restrict what the LLM may call
+    all_tools = build_tools(page)
+    MAIN_TOOL_NAMES = {"find", "click", "type", "wait", "done"}
+    main_tools_for_llm = [t for t in all_tools if t.name in MAIN_TOOL_NAMES]
+
+    # Subgraph for lab
     lab_graph = build_lab_records_subgraph(page)
 
-    def _ensure_defaults(state: AgentState) -> AgentState:
-        state.setdefault("iteration_count", 0)
-        state.setdefault("messages", [])
-        state.setdefault("lab_needed", False)
-        state.setdefault("lab_started", False)
-        return state
-
-    # ── Nodes ────────────────────────────────────────────────────────────────
-    def normalize_node(state: AgentState) -> AgentState:
-        """
-        Rewrite GOAL into a canonical plan (appointments/lab_results/payments/immunisations).
-        NOTE: We do NOT set lab_needed here; we only set it after a click to the Lab URL.
-        """
-        state = _ensure_defaults(state)
-        if not state["messages"]:
-            return state
-
-        new_msgs = list(state["messages"])
-        for i, msg in enumerate(new_msgs):
-            if isinstance(msg, HumanMessage) and isinstance(msg.content, str) and msg.content.startswith("GOAL:"):
-                raw_goal = msg.content[len("GOAL:"):].strip()
-                canon = llm_normalize_goal(raw_goal, page_vocab)
-                plan = canon or "find('appointments') then click the best match, then done"
-                new_msgs[i] = HumanMessage(f"GOAL: {plan}")
-                break
-        state["messages"] = new_msgs
-        return state
-
     def agent_node(state: AgentState) -> AgentState:
-        """
-        Deterministic execution with no human-in-the-loop:
-          - find(): 0 → done; ≥1 → auto-pick first with selector.
-          - click(): if ok=False → done(reason); if href is Lab page → mark lab_needed and yield wait(0).
-          - stop on 'done'.
-        """
-        state = _ensure_defaults(state)
+        state.setdefault("messages", [])
+        state.setdefault("iteration_count", 0)
+        state.setdefault("lab_prep", False)
+        state.setdefault("lab_prep_tries", 0)
+        state.setdefault("lab_ready", False)
+
         state["iteration_count"] += 1
 
-        # Handle tool observations
+        # Handle last tool observation
         if state["messages"] and isinstance(state["messages"][-1], ToolMessage):
             last = state["messages"][-1]
             name = (getattr(last, "name", "") or "").lower()
 
-            if name == "done":
-                # Terminal; emit a short acknowledgment (the router will handle subgraph handoff).
-                return {**state, "messages": [AIMessage(content="✅ Finished.")]}
-
-            # Standardize payload shape
+            # Normalize tool payload for convenience
             try:
                 payload = json.loads(last.content or "{}")
             except Exception:
                 payload = {}
             data = payload.get("data", payload) or {}
 
-            if name == "find":
-                total = int(data.get("total", 0))
-                matches = data.get("matches", []) or []
-                if total <= 0:
-                    return {**state, "messages": [_done("No matching elements were found.")]}
-
-                # Prefer first with a usable selector
-                first = next((m for m in matches if m.get("selector")), None)
-                if not first:
-                    return {**state, "messages": [_done("Matches lacked usable selectors.")]}
-
-                return {**state, "messages": [_ai_tool_call("click", {"selector": first["selector"]})]}
-
+            # 1) After click, detect Lab URL and start server-side prep (idle+poll snapshot)
             if name == "click":
-                if not data.get("ok", True):
-                    sel = data.get("selector") or ""
-                    return {**state, "messages": [_done(f"Click failed for '{sel}'.")]}
-
-                # Detect Lab destination and set gate for subgraph
                 href = (data.get("href") or data.get("navigate_to") or "")
-                if isinstance(href, str) and "/lab-test-reports/lab" in href.lower():
-                    state["lab_needed"] = True
-                    # Yield a no-op to let router transition to subgraph cleanly
-                    return {**state, "messages": [_ai_tool_call("wait", {"seconds": 0})]}
+                if isinstance(href, str) and _is_lab_url(href):
+                    # Start prep: wait_for_idle then get_page_state
+                    state["lab_prep"] = True
+                    state["lab_prep_tries"] = 0
+                    return {**state, "messages": [
+                        _ai_tool_call("wait_for_idle", LAB_IDLE),
+                        _ai_tool_call("get_page_state", {})
+                    ]}
 
-                # Otherwise, normal flow continues (LLM decides next tool)
+            # 2) While in prep, keep polling until the Lab page is ready
+            if state["lab_prep"]:
+                if name == "get_page_state":
+                    snap = data or {}
+                    if _ready_enough(snap):
+                        state["lab_ready"] = True
+                        state["lab_prep"] = False
+                        # (Optional) save snapshot if you want: state["lab_snapshot"] = snap
+                        # Hand over to subgraph by just returning; routing handles it
+                        return state
+                    # Not ready → try again a few times
+                    tries = state.get("lab_prep_tries", 0) + 1
+                    state["lab_prep_tries"] = tries
+                    if tries < LAB_PREP_MAX_TRIES:
+                        return {**state, "messages": [
+                            _ai_tool_call("wait", {"ms": LAB_WAIT_MS}),
+                            _ai_tool_call("get_page_state", {})
+                        ]}
+                    # Give up gracefully; let subgraph handle its own waiting as a fallback
+                    state["lab_ready"] = False
+                    state["lab_prep"] = False
+                    return state
 
-        # Safety cap
+                # After the initial wait_for_idle, the next ToolMessage will be get_page_state
+                if name == "wait_for_idle":
+                    return {**state, "messages": [_ai_tool_call("get_page_state", {})]}
+
+        # Safety stop
         if state["iteration_count"] >= MAX_ITERATIONS:
             return {**state, "messages": [_done("Max steps reached.")]}
 
-        # Ask LLM for the next tool call following the normalized plan
-        raw_html_excerpt = safe_excerpt(page.get("raw_html", ""), max_chars=400) if isinstance(page.get("raw_html"), str) else ""
-        page_context = {
-            "url": page.get("url"),
-            "title": page.get("title"),
-            "counts": {
-                "buttons": len(page.get("buttons", [])),
-                "links": len(page.get("links", [])),
-                "inputs": len(page.get("inputs", [])),
-                "vocab": len(page_vocab),
-            },
-            "vocab_top": page_vocab[:30],
-            "samples": {"buttons": page.get("buttons", [])[:12], "inputs": page.get("inputs", [])[:8]},
-            "raw_html_excerpt": raw_html_excerpt,
-        }
-
-        messages = state["messages"] + [
-            HumanMessage(f"PAGE_CONTEXT_JSON: {json.dumps(page_context, ensure_ascii=False)}"),
-            HumanMessage(SCHEMA_HINT),  # strict schema: emit ONE tool call JSON (find/click/type/wait/done)
-        ]
-        resp = llm.invoke(messages)
-        ai_msg = as_tool_call_ai_message(resp.content, allowed)
-
+        # Normal LLM planning turn (restricted tools)
+        # Note: we do NOT expose heavy tools to the LLM; only to ToolNode.
+        system_hint = SystemMessage(content=(
+            "You can call only these tools: find(query), click(selector), type(selector,text), wait(seconds|ms), done(reason)."
+        ))
+        resp = llm.invoke([system_hint] + state["messages"])
+        ai_msg = as_tool_call_ai_message(resp.content, MAIN_TOOL_NAMES)
         return {**state, "messages": [ai_msg]}
 
-    def after_tools(state: AgentState):
-        """
-        Router after each tool result:
-          - If lab is needed and not started, jump to 'mark_lab' (then into the subgraph),
-            even if a 'done' was produced by the main agent.
-          - Otherwise, if we see a terminal 'done', end.
-          - Else continue the main agent loop.
-        """
-        state = _ensure_defaults(state)
-
-        if state.get("lab_needed") and not state.get("lab_started"):
-            return "mark_lab"
-
+    # Route to subgraph when lab is ready (or you can allow subgraph to wait further)
+    def router_after_tools(state: AgentState):
+        # If the last tool produced 'done', end.
         last = state["messages"][-1]
         if isinstance(last, ToolMessage) and (getattr(last, "name", "").lower() == "done"):
             return END
+        # If lab snapshot is ready, jump into lab subgraph
+        if state.get("lab_ready"):
+            return "lab"
         return "agent"
 
-    # flips the flag exactly once before subgraph hand-off
-    def mark_lab(state: AgentState) -> AgentState:
-        s = _ensure_defaults(state)
-        s["lab_started"] = True
-        return s
-
-    # ── Wiring ───────────────────────────────────────────────────────────────
     g = StateGraph(AgentState)
-    g.add_node("normalize", normalize_node)
     g.add_node("agent", agent_node)
-    g.add_node("tools", ToolNode(tools))
-    g.add_node("mark_lab", mark_lab)
-    g.add_node("lab_records", lab_graph)
+    g.add_node("tools", ToolNode(all_tools))      # ToolNode has ALL tools
+    g.add_node("lab", lab_graph)                  # compiled subgraph
 
-    # main flow
-    g.add_edge(START, "normalize")
-    g.add_edge("normalize", "agent")
+    g.add_edge(START, "agent")
     g.add_conditional_edges("agent", tools_condition, {"tools": "tools", END: END})
-    g.add_conditional_edges("tools", after_tools, {
-        "agent": "agent",
-        "mark_lab": "mark_lab",
-        END: END
-    })
+    g.add_conditional_edges("tools", router_after_tools, {"agent": "agent", "lab": "lab", END: END})
+    g.add_edge("lab", END)
 
-    # after marking, jump into subgraph
-    g.add_edge("mark_lab", "lab_records")
-
-    # No checkpointer: truly stateless per request
     return g.compile()

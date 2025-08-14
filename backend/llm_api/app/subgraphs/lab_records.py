@@ -98,22 +98,19 @@ def _compact_snapshot_for_llm(snap: Dict[str, Any], *, max_links: int = 120, max
 
 
 def _is_lab_url(url: Optional[str]) -> bool:
-    if not isinstance(url, str):
-        return False
-    u = url.lower()
-    return "/lab-test-reports/lab" in u
+    return isinstance(url, str) and "/lab-test-reports/lab" in url.lower()
 
 
 def _ready_enough(snap: Dict[str, Any]) -> bool:
     # Require the Lab page URL AND enough content before we proceed
     if not snap or not isinstance(snap, dict):
         return False
-    url = snap.get("url")
-    if not isinstance(url, str) or ("/lab-test-reports/lab" not in url.lower()):
+    if not _is_lab_url(snap.get("url")):
         return False
     links = snap.get("links") or []
     headings = snap.get("headings") or []
     return (len(headings) >= 1) and (len(links) >= 5)
+
 
 def _done_json(obj: Dict[str, Any]) -> AIMessage:
     return _ai_tool_call("done", {"reason": json.dumps(obj, ensure_ascii=False)})
