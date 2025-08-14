@@ -6,7 +6,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     # Mongo
-    MONGODB_URI: str = "mongodb+srv://lingolah:gs2uLV5YUrxXHKvL@lingolah.mbxwcxo.mongodb.net/?retryWrites=true&w=majority&appName=LingoLah"
+    MONGODB_URI: str = ""
     DB_NAME: str = "lingolah_sea_lion_llm"
 
     # vLLM (OpenAI-compatible)
@@ -24,7 +24,7 @@ class Settings(BaseSettings):
     SESSION_TTL_HOURS: int = 24
     CONTEXT_LAST_N: int = 12
 
-    ADMIN_API_KEY: str = "sk-xa4tlBRcll8VY-TFFnZiFA"
+    ADMIN_API_KEY: str = ""
 
     model_config = SettingsConfigDict(
         env_file=".env",
