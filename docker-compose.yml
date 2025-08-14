@@ -1,5 +1,5 @@
 services:
-  backend:
+  tts_backend:
     build:
       context: ./backend/text_to_speech_api
     ports:
@@ -11,6 +11,38 @@ services:
         - path: ./backend/text_to_speech_api
           target: /app
           action: sync
+
+  llm_backend:
+    build:
+      context: ./backend/sea_lion_llm_api
+    ports:
+      - "8001:8001"
+    environment:
+      - PYTHONUNBUFFERED=1
+      - VLLM_BASE_URL=http://vllm_server:8000/v1
+      - MODEL_ID=aisingapore/Llama-SEA-LION-v3.5-8B-R
+    depends_on:
+      - vllm_server
+    develop:
+      watch:
+        - path: ./backend/sea_lion_llm_api
+          target: /app
+          action: sync
+
+  vllm_server:
+    image: vllm/vllm-openai:latest
+    ports:
+      - "8002:8000"
+    environment:
+      - MODEL=aisingapore/Llama-SEA-LION-v3.5-8B-R
+    command: ["python", "-m", "vllm.entrypoints.openai.api_server", "--model", "aisingapore/Llama-SEA-LION-v3.5-8B-R", "--host", "0.0.0.0", "--port", "8000"]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
 
   frontend:
     build:
