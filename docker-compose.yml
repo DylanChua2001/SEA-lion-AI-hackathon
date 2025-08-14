@@ -12,45 +12,43 @@ services:
           target: /app
           action: sync
 
-  llm_backend:
+  llm_api:
     build:
-      context: ./backend/sea_lion_llm_api
+      context: ./backend/llm_api
     ports:
-      - "8001:8001"
+      - "8001:8000"
+    env_file:
+      - ./backend/llm_api/.env
     environment:
       - PYTHONUNBUFFERED=1
-      - VLLM_BASE_URL=http://vllm_server:8000/v1
-      - MODEL_ID=aisingapore/Llama-SEA-LION-v3.5-8B-R
-    depends_on:
-      - vllm_server
     develop:
       watch:
-        - path: ./backend/sea_lion_llm_api
+        - path: ./backend/llm_api
           target: /app
           action: sync
 
-  vllm_server:
-    image: vllm/vllm-openai:latest
-    ports:
-      - "8002:8000"
-    environment:
-      - MODEL=aisingapore/Llama-SEA-LION-v3.5-8B-R
-    command: ["python", "-m", "vllm.entrypoints.openai.api_server", "--model", "aisingapore/Llama-SEA-LION-v3.5-8B-R", "--host", "0.0.0.0", "--port", "8000"]
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
+  # scrape_ingest:
+  #   build:
+  #     context: ./backend/scrape_ingest
+  #   ports:
+  #     - "8002:8000"
+  #   env_file:
+  #     - ./backend/scrape_ingest/.env
+  #   environment:
+  #     - PYTHONUNBUFFERED=1
+  #   develop:
+  #     watch:
+  #       - path: ./backend/scrape_ingest
+  #         target: /app
+  #         action: sync
 
-  frontend:
-    build:
-      context: ./frontend
-    ports:
-      - "8080:80"
-    develop:
-      watch:
-        - path: ./frontend
-          target: /usr/share/nginx/html
-          action: sync
+  # frontend:
+  #   build:
+  #     context: ./frontend
+  #   ports:
+  #     - "8080:80"
+  #   develop:
+  #     watch:
+  #       - path: ./frontend
+  #         target: /usr/share/nginx/html
+  #         action: sync
