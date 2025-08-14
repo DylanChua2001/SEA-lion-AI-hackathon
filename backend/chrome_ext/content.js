@@ -16,29 +16,54 @@ function nodeToPath(el) {
 
 function snapshot() {
   const buttons = [...document.querySelectorAll("a,button,[role='button']")]
-    .slice(0, 400).map(b => ({
+    .slice(0, 400)
+    .map(b => ({
       text: (b.innerText || "").trim().slice(0, 160),
       selector: nodeToPath(b)
     }));
+
   const links = [...document.querySelectorAll("a[href]")]
-    .slice(0, 400).map(a => ({
+    .slice(0, 400)
+    .map(a => ({
       text: (a.innerText || "").trim().slice(0, 200),
       selector: nodeToPath(a),
       href: a.href
     }));
+
   const inputs = [...document.querySelectorAll("input,textarea,select")]
-    .slice(0, 200).map(i => ({
-      name: i.name || i.id || i.placeholder || i.ariaLabel || "",
+    .slice(0, 200)
+    .map(i => ({
+      name: i.name || i.id || i.placeholder || i.getAttribute("aria-label") || "",
+      placeholder: i.placeholder || "",
+      ariaLabel: i.getAttribute("aria-label") || "",
       selector: nodeToPath(i)
     }));
+
   const raw_html = document.documentElement.outerHTML;
-  const nav_links = [...document.querySelectorAll('nav a,[role="navigation"] a')].slice(0, 200)
+
+  const nav_links = [...document.querySelectorAll('nav a,[role="navigation"] a')]
+    .slice(0, 200)
     .map(a => ({ text: a.innerText.trim(), selector: nodeToPath(a), href: a.href }));
-  const breadcrumbs = [...document.querySelectorAll('[aria-label*="breadcrumb" i] a')].slice(0, 20)
+
+  const breadcrumbs = [...document.querySelectorAll('[aria-label*="breadcrumb" i] a')]
+    .slice(0, 20)
     .map(a => ({ text: a.innerText.trim(), selector: nodeToPath(a), href: a.href }));
-  const headings = [...document.querySelectorAll('h1,h2,[role="heading"]')].slice(0, 50)
+
+  const headings = [...document.querySelectorAll('h1,h2,[role="heading"]')]
+    .slice(0, 50)
     .map(h => ({ text: (h.innerText || "").trim().slice(0, 200), selector: nodeToPath(h) }));
-  return { url: location.href, title: document.title, buttons, links, inputs, nav_links, breadcrumbs, headings, raw_html };
+
+  return {
+    url: location.href,
+    title: document.title,
+    buttons,
+    links,
+    inputs,
+    nav_links,
+    breadcrumbs,
+    headings,
+    raw_html
+  };
 }
 
 function extractContains(q) {
@@ -53,17 +78,20 @@ async function findImpl({ query, max = 10 }) {
   let textQuery = contains || raw.replace(/^a:/i, "").trim();
 
   const all = [...document.querySelectorAll("a,button,[role='button']")];
-  const scored = all.map(el => {
-    const text = (el.innerText || "").trim();
-    let score = 0;
-    const t = text.toLowerCase();
-    const q = (textQuery || "").toLowerCase();
-    if (q && t.includes(q)) score += 10;
-    if (/appointment/.test(t)) score += 3;
-    return { el, text, score };
-  }).filter(x => x.score > 0);
+  const scored = all
+    .map(el => {
+      const text = (el.innerText || "").trim();
+      let score = 0;
+      const t = text.toLowerCase();
+      const q = (textQuery || "").toLowerCase();
+      if (q && t.includes(q)) score += 10;
+      if (/appointment/.test(t)) score += 3; // tiny bias (kept from your original)
+      return { el, text, score };
+    })
+    .filter(x => x.score > 0);
 
   scored.sort((a, b) => b.score - a.score);
+
   const top = scored.slice(0, max).map(x => ({
     text: x.text,
     selector: nodeToPath(x.el),
@@ -98,7 +126,8 @@ async function clickImpl({ selector, text, query }) {
   }
   robustClick(el);
   const href = (el.tagName === "A" && el.href) ? el.href : null;
-  return { ok: true, selector: nodeToPath(el), href, navigating: !!href };
+  // ⬇️ Return BOTH href and navigate_to so either field can be consumed upstream
+  return { ok: true, selector: nodeToPath(el), href, navigate_to: href, navigating: !!href };
 }
 
 async function typeImpl({ selector, text, value }) {
@@ -154,10 +183,18 @@ async function backImpl() {
   return { navigating: true };
 }
 
-// Optional: some models emit "wait" (milliseconds)
-async function waitImpl({ ms = 500 }) {
-  await sleep(ms);
-  return { waited: ms };
+// Optional: some models call "wait" with seconds; support seconds OR ms
+async function waitImpl({ ms, seconds }) {
+  let durationMs = 0;
+  if (typeof seconds === "number") {
+    durationMs = Math.max(0, Math.min(60, seconds)) * 1000;
+  } else if (typeof ms === "number") {
+    durationMs = ms;
+  } else {
+    durationMs = 500;
+  }
+  await sleep(durationMs);
+  return { waited: durationMs };
 }
 
 const TOOL_IMPL = {
@@ -166,7 +203,7 @@ const TOOL_IMPL = {
   click: clickImpl,
   type: typeImpl,
   wait_for: waitForImpl,
-  wait: waitImpl,              // NEW (optional)
+  wait: waitImpl,              // accepts {seconds} or {ms}
   nav: navImpl,
   wait_for_load: waitForLoadImpl,
   wait_for_idle: waitForIdleImpl,

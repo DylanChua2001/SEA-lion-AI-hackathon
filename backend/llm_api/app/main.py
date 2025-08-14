@@ -46,4 +46,3 @@ async def agent_run(req: AgentRunRequest) -> AgentRunResponse:
         thread_id=req.thread_id or "web-agent",
     )
     return AgentRunResponse(messages=_serialize_messages(msgs))
-

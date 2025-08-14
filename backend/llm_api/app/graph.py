@@ -74,8 +74,7 @@ def build_app_for_page(page: dict):
     """
     llm = make_llm(temperature=0)
     tools = build_tools(page)
-    # Disallow 'done' as a tool in this app: we end only after human confirmation (interrupt).
-    allowed = {t.name for t in tools if t.name != "done"}
+    allowed = {t.name for t in tools}
     page_vocab = _build_page_vocab(page)
 
     def _ensure_defaults(state: AgentState) -> AgentState:
@@ -83,9 +82,6 @@ def build_app_for_page(page: dict):
         state.setdefault("feedback_required", False)
         state.setdefault("messages", [])
         state.setdefault("pending_options", None)
-        state.setdefault("lab_results_mode", False)
-        state.setdefault("lab_results_followup_started", False)
-        state.setdefault("awaiting_done_confirm", False)
         return state
 
     def _auto_click(selector: str, state: AgentState) -> AgentState:
@@ -113,35 +109,6 @@ def build_app_for_page(page: dict):
 
     # ── Nodes ─────────────────────────────────────────────────────────────────
 
-    def lab_results_workflow(state: AgentState) -> AgentState:
-        """
-        Post-entry workflow after clicking into Lab Results.
-        Always wait briefly so the page can load before searching.
-        """
-        state = _ensure_defaults(state)
-        if not state.get("lab_results_followup_started"):
-            state["lab_results_followup_started"] = True
-            # Always wait first to give browser a chance to render
-            return {
-                **state,
-                "messages": [AIMessage(content="", tool_calls=[{
-                    "id": f"call_wait_{uuid.uuid4().hex[:6]}",
-                    "type": "tool_call",
-                    "name": "wait",
-                    "args": {"seconds": 2},  # pause for 2 seconds
-                }])]
-            }
-        # After the wait, immediately try the targeted search
-        return {
-            **state,
-            "messages": [AIMessage(content="", tool_calls=[{
-                "id": f"call_find_{uuid.uuid4().hex[:6]}",
-                "type": "tool_call",
-                "name": "find",
-                "args": {"query": "View details|Download|View Report|Open Report|Report"},
-            }])]
-        }
-
     def normalize_node(state: AgentState) -> AgentState:
         """
         Rewrite any GOAL to a canonical four-path plan via llm_normalize_goal().
@@ -158,15 +125,8 @@ def build_app_for_page(page: dict):
                 raw_goal = msg.content[len("GOAL:"):].strip()
                 canon = llm_normalize_goal(raw_goal, page_vocab)
                 # If for any reason normalizer returns None, default to appointments entry
-                plan = canon or "find('appointments') then click the best match"
-                # Strip trailing 'then done' to avoid premature finishes
-                import re as _re
-                plan = _re.sub(r"\s*then\s*done\s*$", "", plan, flags=_re.I)
+                plan = canon or "find('appointments') then click the best match, then done"
                 new_msgs[i] = HumanMessage(f"GOAL: {plan}")
-                # mark lab-results path for follow-up
-                low = (plan or '').lower()
-                if ('lab results' in low) or ('lab reports' in low) or ('test results' in low):
-                    state['lab_results_mode'] = True
                 break
         state["messages"] = new_msgs
         return state
@@ -176,7 +136,7 @@ def build_app_for_page(page: dict):
         Execute the plan strictly via tool calls.
         - On find(): if 0 matches → ask user; if 1 match → auto-click; else show options.
         - On click(): continue; if click fails → ask user.
-        - Stop only after human confirms (via interrupt).
+        - Stop on 'done'.
         """
         state = _ensure_defaults(state)
 
@@ -185,16 +145,6 @@ def build_app_for_page(page: dict):
             ans_msg = next((m for m in reversed(state["messages"]) if isinstance(m, HumanMessage)), None)
             if ans_msg:
                 ans = (ans_msg.content or "").strip()
-
-                # If we were waiting for a done confirmation, handle it here
-                if state.get("awaiting_done_confirm"):
-                    if ans.lower() in {"done", "finish", "confirm", "yes", "y"}:
-                        state["feedback_required"] = False
-                        state["awaiting_done_confirm"] = False
-                        # Finish without using a 'done' tool (clean END via tools_condition)
-                        return {**state, "messages": [AIMessage(content="✅ Finished.")]}
-                    # else fall through to normal handling (treat as instructions)
-
                 opts = state.get("pending_options") or []
                 chosen = None
                 if ans.isdigit() and opts:
@@ -216,9 +166,7 @@ def build_app_for_page(page: dict):
             last_name = (getattr(last, "name", "") or "").lower()
 
             if last_name == "done":
-                # Require human confirmation before truly finishing
-                state["awaiting_done_confirm"] = True
-                return _ask_user("Confirm we are finished. Reply 'done' to finish or type what to do next.", state)
+                return {**state, "messages": [AIMessage(content="✅ Finished.")]}
 
             if last_name == "find":
                 payload = json.loads(last.content or "{}")
@@ -245,16 +193,6 @@ def build_app_for_page(page: dict):
                 if not payload.get("ok", True):
                     sel = payload.get("selector") or ""
                     return _ask_user(f"Click failed for '{sel}'. What should I click instead?", state)
-                # NEW: after a click, insert a short wait before proceeding
-                return {
-                    **state,
-                    "messages": [AIMessage(content="", tool_calls=[{
-                        "id": f"call_wait_{uuid.uuid4().hex[:6]}",
-                        "type": "tool_call",
-                        "name": "wait",
-                        "args": {"seconds": 1.5},  # pause after click
-                    }])]
-                }
 
         if state["iteration_count"] >= MAX_ITERATIONS:
             return _ask_user("I've tried multiple steps. Please guide me on the exact next action.", state)
@@ -284,17 +222,8 @@ def build_app_for_page(page: dict):
 
     def after_tools(state: AgentState):
         last = state["messages"][-1]
-        if isinstance(last, ToolMessage):
-            tool_name = (getattr(last, "name", "") or "").lower()
-            if tool_name == "done":
-                # Defer finishing to agent_node which asks for human confirmation
-                return "agent"
-            # If we just clicked while in lab-results mode and haven't started follow-up, branch
-            if state.get("lab_results_mode") and (tool_name == "click") and (not state.get("lab_results_followup_started")):
-                return "lab_results_workflow"
-            # If we just waited in lab-results mode, continue with targeted find
-            if state.get("lab_results_mode") and (tool_name == "wait"):
-                return "lab_results_workflow"
+        if isinstance(last, ToolMessage) and (getattr(last, "name", "").lower() in ("done",)):
+            return END
         return "agent"
 
     # ── Graph wiring ──────────────────────────────────────────────────────────
@@ -302,11 +231,10 @@ def build_app_for_page(page: dict):
     g.add_node("normalize", normalize_node)
     g.add_node("agent", agent_node)
     g.add_node("tools", ToolNode(tools))
-    g.add_node("lab_results_workflow", lab_results_workflow)
 
     g.add_edge(START, "normalize")
     g.add_edge("normalize", "agent")
     g.add_conditional_edges("agent", tools_condition, {"tools": "tools", END: END})
-    g.add_conditional_edges("tools", after_tools, {"agent": "agent", "lab_results_workflow": "lab_results_workflow", END: END})
+    g.add_conditional_edges("tools", after_tools, {"agent": "agent", END: END})
 
     return g.compile(checkpointer=CHECKPOINTER)
