@@ -1,5 +1,6 @@
 // popup.js
 const API = "http://127.0.0.1:8001"; // FastAPI
+const LAB_URL_TOKEN = "/lab-test-reports/lab"; // used to confirm arrival
 
 function log(m) {
   const el = document.getElementById("log");
@@ -36,7 +37,6 @@ async function postSnapshot(snap, { retries = 2 } = {}) {
   return false;
 }
 
-// Debounce to avoid flooding the server during SPA reflows
 let _debounceTimer = null;
 let _debounceLastSnap = null;
 function postSnapshotDebounced(snap) {
@@ -68,8 +68,6 @@ chrome.runtime.onMessage.addListener((msg) => {
       top_links: firstN(links, 5),
     };
     log("** FRESH SNAPSHOT: " + JSON.stringify(summary));
-
-    // Forward to server (debounced) so subgraphs see the live DOM
     postSnapshotDebounced(snap);
   }
 });
@@ -97,80 +95,63 @@ async function waitForTabNavigation(tabId, { timeout = 25000 } = {}) {
   });
 }
 
-/* ------------------------- Small utilities ------------------------- */
+/* ------------------------- Utilities ------------------------- */
 
 function sanitizeGoal(input) {
-  // Strip common XPath/CSS fragments that confuse the planner's text-only `find`
   return (input || "")
-    .replace(/\/\/[^ ]+/g, " ")      // remove //xpath like bits
-    .replace(/\[[^\]]+\]/g, " ")     // remove [predicates]
-    .replace(/[:.#>][\w\-()]+/g, " ")// remove obvious CSS tokens
+    .replace(/\/\/[^ ]+/g, " ")
+    .replace(/\[[^\]]+\]/g, " ")
+    .replace(/[:.#>][\w\-()]+/g, " ")
     .replace(/\s+/g, " ")
     .trim();
 }
 
-/* ------------------------- Main loop (stateless) ------------------------- */
+async function runTool(tabId, tool, args) {
+  return chrome.tabs.sendMessage(tabId, { type: "RUN_TOOL", tool, args });
+}
 
-async function onRun() {
-  const tab = await getActiveTab();
-  if (!tab) return log("No active tab");
+async function injectTools(tabId) {
+  await chrome.scripting.executeScript({ target: { tabId }, files: ["content.js"] });
+}
 
-  // Track this tab and auto-snapshot on page changes
-  await chrome.runtime.sendMessage({ type: "START_TRACK_TAB", tabId: tab.id }).catch(() => {});
-
-  // Always start from HealthHub home
-  await chrome.tabs.update(tab.id, { url: "https://www.healthhub.sg/" });
-  await waitForTabNavigation(tab.id);
-
-  // Inject content tools
-  await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ["content.js"] });
-  if (!/^https?:\/\//.test(tab.url || "")) return log("Open a normal webpage first.");
-
-  // Backend health check
-  const h = await fetch(`${API}/health`).then(r => r.json()).catch(e => ({ error: String(e) }));
-  log("health: " + JSON.stringify(h));
-  if (!h || h.ok !== true) return log("Backend not healthy");
-
-  // Sanitize goal to plain text
-  const rawGoal = (document.getElementById("goal")?.value || "Find the Book Appointment button").trim();
-  const goal = sanitizeGoal(rawGoal);
-
-  const runTool = (tool, args) => chrome.tabs.sendMessage(tab.id, { type: "RUN_TOOL", tool, args });
-
-  // 1) Initial snapshot for context
-  const snap = await runTool("get_page_state", {});
-  if (!snap?.ok) { log("snapshot failed: " + JSON.stringify(snap)); return; }
-  const page_state = snap.data;
-  log(`Snapshot: url=${page_state.url} buttons=${(page_state.buttons || []).length} links=${(page_state.links || []).length}`);
-
-  // Seed the server bridge *synchronously* before we call /agent/run
-  try {
-    await postSnapshot(page_state);
-  } catch (e) {
-    console.warn("bridge snapshot (initial) failed", e);
+async function seedBridgeWithCurrent(tabId) {
+  const snap = await runTool(tabId, "get_page_state", {});
+  if (snap?.ok && snap.data) {
+    await postSnapshot(snap.data);
+    return snap.data;
   }
+  return null;
+}
 
-  log(`Sending to backend (one-shot): current_url=${page_state.url}`);
+/* ------------------------- Core: one planning+execution pass ------------------------- */
 
-  // 2) Request plan (stateless)
+async function runOnce({ tabId, goal, label = "pass" }) {
+  // 1) Snapshot & seed the server before planning
+  const snap = await runTool(tabId, "get_page_state", {});
+  if (!snap?.ok) { log(`[${label}] snapshot failed: ${JSON.stringify(snap)}`); return { ok: false }; }
+  const page_state = snap.data;
+  await postSnapshot(page_state).catch(() => {});
+
+  log(`[${label}] Sending to backend: current_url=${page_state.url}`);
+
+  // 2) Request stateless plan
   const planRes = await fetch(`${API}/agent/run`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      goal,
-      page_state,
-      current_url: page_state.url
-    })
+    body: JSON.stringify({ goal, page_state, current_url: page_state.url }),
   });
-  if (!planRes.ok) { log(`HTTP ${planRes.status} on /agent/run`); return; }
+  if (!planRes.ok) {
+    log(`[${label}] HTTP ${planRes.status} on /agent/run`);
+    return { ok: false };
+  }
 
   const planPayload = await planRes.json();
   const steps = Array.isArray(planPayload?.steps) ? planPayload.steps : [];
-  const hint = planPayload?.hint || {};
-  log(`Plan received: ${steps.length} steps`);
+  const hint  = planPayload?.hint || {};
+  log(`[${label}] Plan received: ${steps.length} steps`);
 
   // 3) Execute steps locally
-  let lastFindTop = null; // <-- remember top find result (for href fallback)
+  let lastFindTop = null;
 
   for (const step of steps) {
     const { tool, args } = step || {};
@@ -181,76 +162,47 @@ async function onRun() {
       break;
     }
 
-    // Optional alias
     const execTool = (tool === "goto") ? "nav" : tool;
     log(`>> RUN_TOOL ${execTool} ${JSON.stringify(args || {})}`);
-
-    // Execute tool
-    let obs = await runTool(execTool, args || {});
+    let obs = await runTool(tabId, execTool, args || {});
     log(`.. OBS ${execTool}: ${JSON.stringify(obs || {})}`);
 
-    // Record last find's top match for later href fallback
     if (execTool === "find" && obs?.ok && Array.isArray(obs.data?.matches) && obs.data.matches.length) {
       lastFindTop = obs.data.matches[0] || null;
     }
 
-    // If CLICK failed (element not found), fall back to navigating to last find's href
+    // Fallbacks for click → nav
     if (execTool === "click" && (!obs?.ok || obs?.data?.error === "element not found")) {
       if (lastFindTop?.href) {
-        log(`.. CLICK fallback: navigating to last find href ${lastFindTop.href}`);
-        try {
-          await chrome.tabs.update(tab.id, { url: lastFindTop.href });
-          obs = { ok: true, data: { navigating: lastFindTop.href } };
-        } catch (e) {
-          log(`.. CLICK fallback failed: ${e?.message || e}`);
-        }
+        log(`.. CLICK fallback: navigating to ${lastFindTop.href}`);
+        await chrome.tabs.update(tabId, { url: lastFindTop.href }).catch(() => {});
+        obs = { ok: true, data: { navigating: lastFindTop.href } };
       }
     }
-
-    // If CLICK succeeded but didn’t navigate (common on JS-intercepted anchors), force nav to last find href
     if (execTool === "click" && obs?.ok && !obs.data?.navigating && lastFindTop?.href) {
       log(`.. CLICK no nav; forcing nav to ${lastFindTop.href}`);
-      try {
-        await chrome.tabs.update(tab.id, { url: lastFindTop.href });
-        obs = { ok: true, data: { navigating: lastFindTop.href } };
-      } catch (e) {
-        log(`.. force nav failed: ${e?.message || e}`);
-      }
+      await chrome.tabs.update(tabId, { url: lastFindTop.href }).catch(() => {});
+      obs = { ok: true, data: { navigating: lastFindTop.href } };
     }
-
-    // Also handle explicit navigate_to from content click (anchors)
     if (execTool === "click" && obs?.ok && obs.data?.navigate_to) {
-      try {
-        await chrome.tabs.update(tab.id, { url: obs.data.navigate_to });
-        obs = { ok: true, data: { navigating: obs.data.navigate_to } };
-        log(`.. NAV via chrome.tabs.update -> ${obs.data.navigating}`);
-      } catch (e) {
-        console.warn("chrome.tabs.update failed", e);
-      }
+      await chrome.tabs.update(tabId, { url: obs.data.navigate_to }).catch(() => {});
+      obs = { ok: true, data: { navigating: obs.data.navigate_to } };
+      log(`.. NAV via chrome.tabs.update -> ${obs.data.navigating}`);
     }
 
-    // If navigation occurred, wait, re-inject tools, let page settle, then seed the bridge
+    // If we navigated, wait, re-inject tools, idle, then seed the bridge
     const navigated = (execTool === "nav") || (obs?.ok && (obs.data?.navigating || obs.data?.href));
     if (navigated) {
-      await waitForTabNavigation(tab.id);
-      await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ["content.js"] });
-      await runTool("wait_for_idle", { quietMs: 700, timeout: 8000 });
-
-      // Synchronous bridge seed after nav settles
-      try {
-        const snapNow = await runTool("get_page_state", {});
-        if (snapNow?.ok && snapNow.data) {
-          await postSnapshot(snapNow.data);
-        }
-      } catch (e) {
-        console.warn("bridge snapshot (post-nav) failed", e);
-      }
+      await waitForTabNavigation(tabId);
+      await injectTools(tabId);
+      await runTool(tabId, "wait_for_idle", { quietMs: 700, timeout: 8000 });
+      await seedBridgeWithCurrent(tabId);
     }
   }
 
-  // 4) Optional arrival verification (independent of auto snapshots)
+  // 4) Arrival / summary hint
   try {
-    const snap2 = await runTool("get_page_state", {});
+    const snap2 = await runTool(tabId, "get_page_state", {});
     if (snap2?.ok) {
       const url = (snap2.data?.url || "").toLowerCase();
       if (hint?.expect_path && url.includes(hint.expect_path)) {
@@ -261,6 +213,52 @@ async function onRun() {
     }
   } catch {}
 
-  // Optional: stop tracking
+  return { ok: true };
+}
+
+/* ------------------------- Main: two-step orchestrated by the popup ------------------------- */
+
+async function onRun() {
+  const tab = await getActiveTab();
+  if (!tab) return log("No active tab");
+
+  // Track this tab (so background auto-snapshots on nav & SPA routes)
+  await chrome.runtime.sendMessage({ type: "START_TRACK_TAB", tabId: tab.id }).catch(() => {});
+
+  // Always start from HealthHub home
+  await chrome.tabs.update(tab.id, { url: "https://www.healthhub.sg/" });
+  await waitForTabNavigation(tab.id);
+
+  // Inject tools and check backend health
+  await injectTools(tab.id);
+  if (!/^https?:\/\//.test(tab.url || "")) return log("Open a normal webpage first.");
+  const h = await fetch(`${API}/health`).then(r => r.json()).catch(e => ({ error: String(e) }));
+  log("health: " + JSON.stringify(h));
+  if (!h || h.ok !== true) return log("Backend not healthy");
+
+  const rawGoal = (document.getElementById("goal")?.value || "view lab results").trim();
+  const goal = sanitizeGoal(rawGoal);
+
+  // PASS 1: navigate (supervisor will route to `lab` and END)
+  log("Sending to backend (one-shot): initiating pass 1 (navigate)");
+  await runOnce({ tabId: tab.id, goal, label: "pass1" });
+
+  // Ensure we seed the latest DOM after any final nav churn
+  await injectTools(tab.id);
+  await runTool(tab.id, "wait_for_idle", { quietMs: 700, timeout: 8000 });
+  const seeded = await seedBridgeWithCurrent(tab.id);
+
+  // If we landed on the lab page (or even if we didn't), do PASS 2.
+  // The supervisor will override to `lab_read` automatically when already on the lab URL.
+  const nowUrl = (seeded?.url || "").toLowerCase();
+  const onLabPage = nowUrl.includes(LAB_URL_TOKEN);
+
+  log(onLabPage
+    ? "Auto two-step: detected lab page. Starting pass 2 (read/extract)…"
+    : "Auto two-step: running pass 2 anyway; router will choose the right subflow…");
+
+  await runOnce({ tabId: tab.id, goal, label: "pass2" });
+
+  // Optional: stop tracking the tab afterwards
   // await chrome.runtime.sendMessage({ type: "STOP_TRACK_TAB" }).catch(() => {});
 }
