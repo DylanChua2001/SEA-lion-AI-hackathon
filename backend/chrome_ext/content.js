@@ -1,4 +1,4 @@
-// content.js (revised)
+// content.js (drop-in with flags + top_* for auth heuristics)
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -6,19 +6,14 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function isElementVisible(el) {
   if (!el || el.nodeType !== 1) return false;
-  // Skip hidden via attribute
   if (el.hasAttribute("hidden")) return false;
   if (el.getAttribute("aria-hidden") === "true") return false;
-
-  // Skip disabled controls
   if (el.hasAttribute("disabled") || el.getAttribute("aria-disabled") === "true") return false;
 
-  // Computed style checks
   const cs = window.getComputedStyle(el);
   if (!cs) return true;
   if (cs.display === "none" || cs.visibility === "hidden" || parseFloat(cs.opacity || "1") === 0) return false;
 
-  // Tiny offscreen elements are often not useful; keep conservative threshold
   const rect = el.getBoundingClientRect?.();
   if (!rect) return true;
   if (rect.width < 2 || rect.height < 2) return false;
@@ -34,7 +29,6 @@ function nodeToPath(el) {
 
   const parts = [];
   let n = el;
-  // Keep paths reasonably short; prefer structure over brittleness
   while (n && n.nodeType === 1 && parts.length < 6) {
     const name = n.tagName.toLowerCase();
     const parent = n.parentElement;
@@ -42,7 +36,6 @@ function nodeToPath(el) {
       parts.unshift(name);
       break;
     }
-    // nth-child is robust enough for mixed UIs
     const idx = Array.prototype.indexOf.call(parent.children, n) + 1;
     parts.unshift(`${name}:nth-child(${idx})`);
     n = parent;
@@ -67,6 +60,62 @@ function dedupeBySignature(arr, makeSig) {
   return out;
 }
 
+/* ────────────────────────────── Page flags (auth) ─────────────────────────── */
+
+/**
+ * Best-effort read of page-scoped JS variables from inline scripts.
+ * We’re in a content-script isolated world, so we can’t access window vars directly.
+ * This scans <script> text for `var sslIsAnonymous = "True"|` patterns.
+ */
+function readFlagFromScripts(name) {
+  try {
+    const re = new RegExp(String.raw`${name}\s*=\s*["']?(True|False|true|false)["']?`, "i");
+    for (const s of document.scripts || []) {
+      const txt = s.textContent || "";
+      const m = re.exec(txt);
+      if (m) return m[1];
+    }
+  } catch {}
+  return null;
+}
+
+function extractAuthFlags() {
+  const url = (location.href || "").toLowerCase();
+
+  // sslIsAnonymous from inline scripts (if present)
+  const sslVar = readFlagFromScripts("sslIsAnonymous");
+  // Normalize to string "True"/"False" to match backend heuristic
+  const sslIsAnonymous =
+    sslVar == null ? null : (String(sslVar).toLowerCase() === "true" ? "True" : "False");
+
+  // Presence of a login affordance
+  const hasLoginButton =
+    !!document.querySelector(".btn-login, a[href*='login' i], button[aria-label*='login' i]");
+
+  // Singpass-like signals (URL or DOM text)
+  const DOM_TEXT_SAMPLE_LIMIT = 50;
+  let sampleText = "";
+  try {
+    // Grab a small slice of visible text to avoid heavy payloads
+    const nodes = Array.from(document.querySelectorAll("a,button,h1,h2,[role='heading']"))
+      .filter(isElementVisible)
+      .slice(0, DOM_TEXT_SAMPLE_LIMIT);
+    sampleText = nodes.map(safeText).join(" ").toLowerCase();
+  } catch {}
+
+  const singpassLike =
+    /singpass|login\.singpass|authorize|oauth|account\/login|myinfo/.test(url) ||
+    /singpass|myinfo/.test(sampleText);
+
+  return {
+    sslIsAnonymous,   // "True" | "False" | null
+    hasLoginButton,   // boolean
+    singpassLike,     // boolean
+  };
+}
+
+/* ────────────────────────────── Snapshot ──────────────────────────────────── */
+
 function snapshot() {
   const q = (sel, limit = 200) => Array.from(document.querySelectorAll(sel)).slice(0, limit);
   const MAX_BUTTONS = 400;
@@ -83,7 +132,6 @@ function snapshot() {
       selector: nodeToPath(b),
     }))
     .filter((b) => b.selector && b.text);
-
   buttons = dedupeBySignature(buttons, (x) => `${x.text}|||${x.selector}`).slice(0, MAX_BUTTONS);
 
   // Links (true anchors)
@@ -95,25 +143,18 @@ function snapshot() {
       href: a.href,
     }))
     .filter((a) => a.selector && a.href);
-
   links = dedupeBySignature(links, (x) => `${x.text}|||${x.href}`).slice(0, MAX_LINKS);
 
   // Inputs
   let inputs = q("input,textarea,select", MAX_INPUTS)
     .filter(isElementVisible)
     .map((i) => ({
-      name:
-        i.name ||
-        i.id ||
-        i.placeholder ||
-        i.getAttribute("aria-label") ||
-        "",
+      name: i.name || i.id || i.placeholder || i.getAttribute("aria-label") || "",
       placeholder: i.placeholder || "",
       ariaLabel: i.getAttribute("aria-label") || "",
       selector: nodeToPath(i),
     }))
     .filter((i) => i.selector);
-
   inputs = dedupeBySignature(inputs, (x) => x.selector).slice(0, MAX_INPUTS);
 
   // Headings
@@ -124,20 +165,17 @@ function snapshot() {
       selector: nodeToPath(h),
     }))
     .filter((h) => h.selector && h.text);
-
   headings = dedupeBySignature(headings, (x) => `${x.text}|||${x.selector}`).slice(0, MAX_HEADINGS);
 
-  // Generic short texts (for report_name like “Full Blood Count”)
-  // Collect from spans/divs/paragraphs/headings; keep only shortish, visible strings.
+  // Short label-like texts (helps report_name extraction)
   let texts = Array.from(document.querySelectorAll("span,div,p,h1,h2,h3"))
     .filter(isElementVisible)
     .map((el) => safeText(el))
-    .filter((t) => t && t.length <= 120) // short labels only
+    .filter((t) => t && t.length <= 120)
     .map((t) => ({ text: t.slice(0, 120) }));
-
   texts = dedupeBySignature(texts, (x) => x.text.toLowerCase()).slice(0, MAX_TEXTS);
 
-  // Navigation helpers (optional but nice to have)
+  // Navigation helpers
   let nav_links = q('nav a,[role="navigation"] a', 200)
     .filter(isElementVisible)
     .map((a) => ({
@@ -158,28 +196,49 @@ function snapshot() {
     .filter((a) => a.selector && a.href);
   breadcrumbs = dedupeBySignature(breadcrumbs, (x) => `${x.text}|||${x.href}`).slice(0, 20);
 
-  // IMPORTANT: Do NOT include full raw_html; it easily explodes token budgets.
-  // If you really need it for debugging:
-  // const raw_html = (window.__DEBUG_SNAPSHOT__ ? (document.documentElement?.outerHTML || "") : undefined);
+  // Build convenience “top_*” lists (text only) for the backend heuristics
+  const firstN = (arr, n) => arr.slice(0, n).map((x) => (x.text || "").trim()).filter(Boolean);
+  const top_buttons = firstN(buttons, 8);
+  const top_links = firstN(links, 8);
+  const top_headings = firstN(headings, 6);
+
+  // Auth/redirect flags
+  const flags = extractAuthFlags();
+
+  // Optional: a session object (leave minimal; backend checks `session.is_authenticated`)
+  // We can’t truly know from the DOM; set null/undefined unless you have a reliable signal.
+  const session = {
+    // is_authenticated: true/false  // intentionally omitted unless you can assert it
+  };
 
   return {
     url: location.href,
     title: document.title,
+
     buttons,
     links,
     inputs,
     nav_links,
     breadcrumbs,
     headings,
-    texts, // <-- enables report_name extraction in subgraph
-    // raw_html,
+    texts,
+
+    // New convenience fields used by backend heuristics
+    top_buttons,
+    top_links,
+    top_headings,
+
+    // New flags for login detection
+    flags,
+    session,
+
+    // raw_html: undefined, // keep off by default
   };
 }
 
 /* ────────────────────────────── Tools: find / click / type ─────────────────────── */
 
 function extractContains(q) {
-  // supports a:contains('Text') or :contains("Text")
   const m = (q || "").match(/:contains\((['"])(.*?)\1\)/i);
   return m ? m[2] : null;
 }
@@ -213,12 +272,11 @@ async function findImpl({ query, max = 10 }) {
 
     let score = 0;
     for (const t of texts) {
-      if (t === textQuery) score += 20;       // exact
-      if (t.includes(textQuery)) score += 10; // substring
-      if (t.startsWith(textQuery)) score += 3;// prefix bias
+      if (t === textQuery) score += 20;
+      if (t.includes(textQuery)) score += 10;
+      if (t.startsWith(textQuery)) score += 3;
     }
 
-    // Nudge for common intents (tiny)
     const st = texts.join(" ");
     if (/\bappointment\b/i.test(st)) score += 2;
     if (/\blab\b|\breport\b|\bresult\b/i.test(st)) score += 2;
@@ -250,7 +308,6 @@ function robustClick(el) {
   const rect = el.getBoundingClientRect();
   const cx = rect.left + Math.max(1, Math.min(rect.width / 2, rect.width - 1));
   const cy = rect.top + Math.max(1, Math.min(rect.height / 2, rect.height - 1));
-  // Fire a simple mouse sequence; el.click() as final fallback
   el.dispatchEvent(new MouseEvent("mousemove", { bubbles: true, clientX: cx, clientY: cy }));
   el.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, clientX: cx, clientY: cy, button: 0 }));
   el.dispatchEvent(new MouseEvent("mouseup",   { bubbles: true, clientX: cx, clientY: cy, button: 0 }));
@@ -277,7 +334,6 @@ async function clickImpl({ selector, text, query }) {
     return { ok: false, selector: selector || null, error: "element not found" };
   }
 
-  // Avoid clicking disabled/hidden controls
   const disabled = el.hasAttribute?.("disabled") || el.getAttribute?.("aria-disabled") === "true";
   const style = window.getComputedStyle?.(el);
   const hidden = style && (style.visibility === "hidden" || style.display === "none");
@@ -287,8 +343,6 @@ async function clickImpl({ selector, text, query }) {
 
   robustClick(el);
   const href = el.tagName === "A" ? (el.href || null) : null;
-
-  // If anchor opens in new tab, still return navigate_to to let the orchestrator handle navigation policy
   const navigating = !!href;
 
   return {
@@ -305,7 +359,6 @@ async function typeImpl({ selector, text, value }) {
   const el = selector ? document.querySelector(selector) : null;
   if (!el) return { ok: false, selector, error: "input not found" };
 
-  // Focus & set value with input/change events
   el.focus();
   try { el.value = ""; el.dispatchEvent(new Event("input", { bubbles: true })); } catch {}
   try { el.value = val ?? ""; el.dispatchEvent(new Event("input", { bubbles: true })); } catch {}
@@ -341,7 +394,6 @@ async function waitForLoadImpl({ timeout = 20000 }) {
 }
 
 async function waitForIdleImpl({ quietMs = 600, timeout = 8000 }) {
-  // crude "network idle": DOM complete + no innerHTML length changes for quietMs
   const tEnd = performance.now() + Math.max(0, timeout);
   let last = document.body?.innerHTML?.length || 0;
   while (performance.now() < tEnd) {
@@ -358,7 +410,6 @@ async function backImpl() {
   return { navigating: true };
 }
 
-// Accept seconds or ms; clamp to <= 60s for safety
 async function waitImpl({ ms, seconds }) {
   let durationMs = 500;
   if (typeof seconds === "number") {
@@ -378,7 +429,7 @@ const TOOL_IMPL = Object.freeze({
   click: clickImpl,
   type: typeImpl,
   wait_for: waitForImpl,
-  wait: waitImpl, // accepts {seconds} or {ms}
+  wait: waitImpl,
   nav: navImpl,
   wait_for_load: waitForLoadImpl,
   wait_for_idle: waitForIdleImpl,
@@ -401,7 +452,6 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         }
         const data = await fn(msg.args || {});
 
-        // Normalize returns so the popup has a consistent {ok,data} envelope
         if (tool === "click" || tool === "type" || tool === "wait_for") {
           if (data && data.ok === false) {
             sendResponse({ ok: false, data });
@@ -419,7 +469,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       sendResponse({ ok: false, data: { selector: sel, error: e?.message || String(e) } });
     }
   })();
-  return true; // keep the message channel open for async
+  return true;
 });
 
-console.log("[content] loaded (revised)");
+console.log("[content] loaded (with flags + top_* for auth heuristics)");

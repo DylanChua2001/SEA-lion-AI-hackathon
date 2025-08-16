@@ -123,6 +123,40 @@ async function seedBridgeWithCurrent(tabId) {
   return null;
 }
 
+/* ------------------------- Auth heuristics (client-side) ------------------------- */
+
+function looksLoggedIn(snap) {
+  if (!snap || typeof snap !== "object") return false;
+
+  // Preferred: server-style session flag
+  if (snap.session && snap.session.is_authenticated === true) return true;
+
+  // From content.js flags (derived from inline scripts/DOM)
+  const flags = snap.flags || {};
+  if (flags.sslIsAnonymous === "True") return false;          // explicitly anonymous
+  if (flags.hasLoginButton === true) return false;            // visible login affordance
+
+  // Text hints (top_* arrays)
+  const list = (x) => (Array.isArray(x) ? x.map((t) => String(t).toLowerCase()) : []);
+  const tb = list(snap.top_buttons);
+  const tl = list(snap.top_links);
+  const th = list(snap.top_headings);
+  if (tb.concat(tl, th).some(t => /logout|my profile|welcome|^hi\s/.test(t))) return true;
+
+  // URL sanity: on eServices and not on any 'login' path
+  const url = String(snap.url || "").toLowerCase();
+  if (url.includes("eservices.healthhub.sg") && !/login/.test(url) && flags.hasLoginButton !== true) return true;
+
+  return false;
+}
+
+function looksLikeSingpass(snap) {
+  const flags = (snap && snap.flags) || {};
+  if (flags.singpassLike) return true;
+  const url = String(snap?.url || "").toLowerCase();
+  return /singpass|login\.singpass|authorize|oauth|account\/login|myinfo/.test(url);
+}
+
 /* ------------------------- Core: one planning+execution pass ------------------------- */
 
 async function runOnce({ tabId, goal, label = "pass" }) {
@@ -216,7 +250,7 @@ async function runOnce({ tabId, goal, label = "pass" }) {
   return { ok: true };
 }
 
-/* ------------------------- Main: two-step orchestrated by the popup ------------------------- */
+/* ------------------------- Main: two-step with login gate ------------------------- */
 
 async function onRun() {
   const tab = await getActiveTab();
@@ -241,23 +275,28 @@ async function onRun() {
 
   // PASS 1: navigate (supervisor will route to `lab` and END)
   log("Sending to backend (one-shot): initiating pass 1 (navigate)");
-  await runOnce({ tabId: tab.id, goal, label: "pass1" });
+  await runOnce({ tabId: tab.id, goal, label: "pass1:navigate" });
 
   // Ensure we seed the latest DOM after any final nav churn
   await injectTools(tab.id);
   await runTool(tab.id, "wait_for_idle", { quietMs: 700, timeout: 8000 });
   const seeded = await seedBridgeWithCurrent(tab.id);
 
-  // If we landed on the lab page (or even if we didn't), do PASS 2.
-  // The supervisor will override to `lab_read` automatically when already on the lab URL.
+  // -------- Login gate between passes --------
+  const needLogin = looksLikeSingpass(seeded) || !looksLoggedIn(seeded);
+  if (needLogin) {
+    log("🔐 Please log in with Singpass in the tab, then click ‘Run Agent’ again.");
+    return; // stop here — user logs in, then re-runs
+  }
+
+  // PASS 2: Reader (router will jump to *_read automatically when already on target URL)
   const nowUrl = (seeded?.url || "").toLowerCase();
   const onLabPage = nowUrl.includes(LAB_URL_TOKEN);
-
   log(onLabPage
     ? "Auto two-step: detected lab page. Starting pass 2 (read/extract)…"
-    : "Auto two-step: running pass 2 anyway; router will choose the right subflow…");
+    : "Auto two-step: running pass 2; router will choose the correct reader…");
 
-  await runOnce({ tabId: tab.id, goal, label: "pass2" });
+  await runOnce({ tabId: tab.id, goal, label: "pass2:read" });
 
   // Optional: stop tracking the tab afterwards
   // await chrome.runtime.sendMessage({ type: "STOP_TRACK_TAB" }).catch(() => {});

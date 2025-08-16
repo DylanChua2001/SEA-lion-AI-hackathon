@@ -2,30 +2,48 @@
 <html>
 <head>
   <meta charset="utf-8" />
+  <title>HealthHub Agent</title>
   <style>
-    body { font-family: system-ui, sans-serif; margin: 12px; width: 300px; }
-    textarea { width: 100%; min-height: 80px; }
-    button { width: 100%; padding: 8px; margin-top: 8px; }
-    pre { white-space: pre-wrap; font-size: 12px; background: #f6f6f6; padding: 8px; max-height: 200px; overflow: auto; }
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 12px; width: 320px; }
+    h3 { margin: 0 0 6px; font-size: 16px; }
+    p.help { font-size:12px; color:#666; margin:8px 0 10px; }
+    textarea { width: 100%; min-height: 84px; padding:8px; border:1px solid #e5e7eb; border-radius:8px; resize: vertical; }
+    button { width: 100%; padding: 10px; margin-top: 10px; border: 0; border-radius: 8px; background:#10b981; color:white; font-weight:600; cursor:pointer; }
+    button:hover { filter: brightness(0.95); }
+    pre { white-space: pre-wrap; font-size: 12px; background: #f6f6f6; padding: 8px; max-height: 220px; overflow: auto; border-radius: 8px; border:1px solid #eee; }
+    /* Clarify box */
+    #clarify { display:none; border:1px solid #e5e7eb; border-radius:12px; padding:10px; margin:10px 0; background:#fafafa; }
+    #clarify-text { font-size:13px; margin-bottom:6px; }
+    #clarify-input { width:100%; min-height:60px; padding:8px; border:1px solid #e5e7eb; border-radius:8px; }
+    #clarify .actions { margin-top:6px; display:flex; gap:8px; }
+    #clarify .actions button { flex:1; padding:8px; margin-top:0; }
+    #clarify-ok { background:#3b82f6; }
+    #clarify-cancel { background:#9ca3af; }
   </style>
 </head>
 <body>
   <h3>HealthHub Agent</h3>
-  <p style="font-size:12px;color:#666;margin:8px 0;">
-    The agent may pause to ask a question if it’s unsure. Your reply will resume the flow.
+  <p class="help">
+    The agent may pause to ask a question or for Singpass login. After you respond/login, click <b>Run Agent</b> again.
   </p>
-  <textarea id="goal" placeholder="Describe what you want to do..."></textarea>
-  <!-- Add inside the body, e.g. under your goal textarea -->
-  <div id="clarify" style="display:none; border:1px solid #e5e7eb; border-radius:12px; padding:10px; margin:10px 0;">
-    <div id="clarify-text" style="font-size:13px; margin-bottom:6px;"></div>
-    <textarea id="clarify-input" rows="2" style="width:100%;"></textarea>
-    <div style="margin-top:6px; display:flex; gap:8px;">
-      <button id="clarify-ok">OK</button>
-      <button id="clarify-cancel">Cancel</button>
+
+  <label for="goal" style="font-size:12px; color:#374151;">Your goal</label>
+  <textarea id="goal" placeholder="e.g., View my lab results from the past year"></textarea>
+
+  <!-- Clarification prompt (shown only when needed) -->
+  <div id="clarify" aria-live="polite">
+    <div id="clarify-text"></div>
+    <textarea id="clarify-input" rows="2" placeholder="Type your answer here…"></textarea>
+    <div class="actions">
+      <button id="clarify-ok" type="button">OK</button>
+      <button id="clarify-cancel" type="button">Cancel</button>
     </div>
   </div>
-  <button id="run">Run Agent</button>
-  <pre id="log"></pre>
+
+  <button id="run" type="button">Run Agent</button>
+
+  <pre id="log" aria-live="polite"></pre>
+
   <script src="popup.js"></script>
 </body>
 </html>
