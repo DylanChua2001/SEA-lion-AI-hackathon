@@ -16,7 +16,42 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("run").addEventListener("click", onRun);
 });
 
-// Listen for auto snapshots from background
+/* ------------------------- Bridge helpers ------------------------- */
+
+async function postSnapshot(snap, { retries = 2 } = {}) {
+  const body = JSON.stringify(snap || {});
+  for (let i = 0; i <= retries; i++) {
+    try {
+      const r = await fetch(`${API}/bridge/snapshot`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body,
+      });
+      if (r.ok) return true;
+    } catch (e) {
+      if (i === retries) throw e;
+      await new Promise((res) => setTimeout(res, 150 + 150 * i));
+    }
+  }
+  return false;
+}
+
+// Debounce to avoid flooding the server during SPA reflows
+let _debounceTimer = null;
+let _debounceLastSnap = null;
+function postSnapshotDebounced(snap) {
+  _debounceLastSnap = snap;
+  if (_debounceTimer) clearTimeout(_debounceTimer);
+  _debounceTimer = setTimeout(async () => {
+    try { await postSnapshot(_debounceLastSnap); }
+    catch (e) { console.warn("bridge snapshot (debounced) failed", e); }
+    _debounceTimer = null;
+    _debounceLastSnap = null;
+  }, 200);
+}
+
+/* ------------------------- Background snapshots ------------------------- */
+
 chrome.runtime.onMessage.addListener((msg) => {
   if (msg?.type === "FRESH_SNAPSHOT") {
     const snap = msg.data || {};
@@ -34,26 +69,16 @@ chrome.runtime.onMessage.addListener((msg) => {
     };
     log("** FRESH SNAPSHOT: " + JSON.stringify(summary));
 
-    // ⬇️ Publish fresh snapshot to server so subgraphs see the live page
-    (async () => {
-      try {
-        await fetch(`${API}/bridge/snapshot`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(snap),
-        });
-      } catch (e) {
-        console.warn("bridge snapshot (fresh) failed", e);
-      }
-    })();
+    // Forward to server (debounced) so subgraphs see the live DOM
+    postSnapshotDebounced(snap);
   }
 });
 
-/* ---------- Tab navigation helper ---------- */
+/* ------------------------- Tab navigation helper ------------------------- */
+
 async function waitForTabNavigation(tabId, { timeout = 25000 } = {}) {
   return new Promise((resolve, reject) => {
     const start = Date.now();
-
     function onUpdated(id, info, tab) {
       if (id === tabId && info.status === "complete" && /^https?:\/\//.test(tab.url || "")) {
         chrome.tabs.onUpdated.removeListener(onUpdated);
@@ -61,9 +86,7 @@ async function waitForTabNavigation(tabId, { timeout = 25000 } = {}) {
         resolve(tab);
       }
     }
-
     chrome.tabs.onUpdated.addListener(onUpdated);
-
     const timer = setInterval(() => {
       if (Date.now() - start > timeout) {
         chrome.tabs.onUpdated.removeListener(onUpdated);
@@ -74,13 +97,26 @@ async function waitForTabNavigation(tabId, { timeout = 25000 } = {}) {
   });
 }
 
-/* ---------- Main loop (stateless) ---------- */
+/* ------------------------- Small utilities ------------------------- */
+
+function sanitizeGoal(input) {
+  // Strip common XPath/CSS fragments that confuse the planner's text-only `find`
+  return (input || "")
+    .replace(/\/\/[^ ]+/g, " ")      // remove //xpath like bits
+    .replace(/\[[^\]]+\]/g, " ")     // remove [predicates]
+    .replace(/[:.#>][\w\-()]+/g, " ")// remove obvious CSS tokens
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/* ------------------------- Main loop (stateless) ------------------------- */
+
 async function onRun() {
   const tab = await getActiveTab();
   if (!tab) return log("No active tab");
 
-  // ⬇️ Tell background to track this tab and auto-snapshot on page changes
-  await chrome.runtime.sendMessage({ type: "START_TRACK_TAB", tabId: tab.id }).catch(() => { });
+  // Track this tab and auto-snapshot on page changes
+  await chrome.runtime.sendMessage({ type: "START_TRACK_TAB", tabId: tab.id }).catch(() => {});
 
   // Always start from HealthHub home
   await chrome.tabs.update(tab.id, { url: "https://www.healthhub.sg/" });
@@ -95,26 +131,26 @@ async function onRun() {
   log("health: " + JSON.stringify(h));
   if (!h || h.ok !== true) return log("Backend not healthy");
 
-  const goal = (document.getElementById("goal")?.value || "Find the Book Appointment button").trim();
+  // Sanitize goal to plain text
+  const rawGoal = (document.getElementById("goal")?.value || "Find the Book Appointment button").trim();
+  const goal = sanitizeGoal(rawGoal);
+
   const runTool = (tool, args) => chrome.tabs.sendMessage(tab.id, { type: "RUN_TOOL", tool, args });
 
-  // 1) Snapshot for context
+  // 1) Initial snapshot for context
   const snap = await runTool("get_page_state", {});
   if (!snap?.ok) { log("snapshot failed: " + JSON.stringify(snap)); return; }
   const page_state = snap.data;
   log(`Snapshot: url=${page_state.url} buttons=${(page_state.buttons || []).length} links=${(page_state.links || []).length}`);
-  log(`Sending to backend (one-shot): current_url=${page_state.url}`);
 
-  // ⬇️ Seed the server’s bridge so subgraphs see the same DOM we see here
+  // Seed the server bridge *synchronously* before we call /agent/run
   try {
-    await fetch(`${API}/bridge/snapshot`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(page_state),
-    });
+    await postSnapshot(page_state);
   } catch (e) {
     console.warn("bridge snapshot (initial) failed", e);
   }
+
+  log(`Sending to backend (one-shot): current_url=${page_state.url}`);
 
   // 2) Request plan (stateless)
   const planRes = await fetch(`${API}/agent/run`, {
@@ -134,6 +170,8 @@ async function onRun() {
   log(`Plan received: ${steps.length} steps`);
 
   // 3) Execute steps locally
+  let lastFindTop = null; // <-- remember top find result (for href fallback)
+
   for (const step of steps) {
     const { tool, args } = step || {};
     if (!tool) continue;
@@ -143,28 +181,66 @@ async function onRun() {
       break;
     }
 
-    // Support optional alias
+    // Optional alias
     const execTool = (tool === "goto") ? "nav" : tool;
     log(`>> RUN_TOOL ${execTool} ${JSON.stringify(args || {})}`);
-    const obs = await runTool(execTool, args || {});
+
+    // Execute tool
+    let obs = await runTool(execTool, args || {});
     log(`.. OBS ${execTool}: ${JSON.stringify(obs || {})}`);
 
-    // If navigation occurred, wait, re-inject tools, and let page settle
+    // Record last find's top match for later href fallback
+    if (execTool === "find" && obs?.ok && Array.isArray(obs.data?.matches) && obs.data.matches.length) {
+      lastFindTop = obs.data.matches[0] || null;
+    }
+
+    // If CLICK failed (element not found), fall back to navigating to last find's href
+    if (execTool === "click" && (!obs?.ok || obs?.data?.error === "element not found")) {
+      if (lastFindTop?.href) {
+        log(`.. CLICK fallback: navigating to last find href ${lastFindTop.href}`);
+        try {
+          await chrome.tabs.update(tab.id, { url: lastFindTop.href });
+          obs = { ok: true, data: { navigating: lastFindTop.href } };
+        } catch (e) {
+          log(`.. CLICK fallback failed: ${e?.message || e}`);
+        }
+      }
+    }
+
+    // If CLICK succeeded but didn’t navigate (common on JS-intercepted anchors), force nav to last find href
+    if (execTool === "click" && obs?.ok && !obs.data?.navigating && lastFindTop?.href) {
+      log(`.. CLICK no nav; forcing nav to ${lastFindTop.href}`);
+      try {
+        await chrome.tabs.update(tab.id, { url: lastFindTop.href });
+        obs = { ok: true, data: { navigating: lastFindTop.href } };
+      } catch (e) {
+        log(`.. force nav failed: ${e?.message || e}`);
+      }
+    }
+
+    // Also handle explicit navigate_to from content click (anchors)
+    if (execTool === "click" && obs?.ok && obs.data?.navigate_to) {
+      try {
+        await chrome.tabs.update(tab.id, { url: obs.data.navigate_to });
+        obs = { ok: true, data: { navigating: obs.data.navigate_to } };
+        log(`.. NAV via chrome.tabs.update -> ${obs.data.navigating}`);
+      } catch (e) {
+        console.warn("chrome.tabs.update failed", e);
+      }
+    }
+
+    // If navigation occurred, wait, re-inject tools, let page settle, then seed the bridge
     const navigated = (execTool === "nav") || (obs?.ok && (obs.data?.navigating || obs.data?.href));
     if (navigated) {
       await waitForTabNavigation(tab.id);
       await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ["content.js"] });
-      await runTool("wait_for_idle", { quietMs: 600, timeout: 6000 });
-      // ⬆️ Background will also auto-snapshot and push **FRESH_SNAPSHOT** here (and we forward it to the server).
-      // ⬇️ Synchronous, guaranteed bridge seed after navigation settles
+      await runTool("wait_for_idle", { quietMs: 700, timeout: 8000 });
+
+      // Synchronous bridge seed after nav settles
       try {
         const snapNow = await runTool("get_page_state", {});
         if (snapNow?.ok && snapNow.data) {
-          await fetch(`${API}/bridge/snapshot`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(snapNow.data),
-          });
+          await postSnapshot(snapNow.data);
         }
       } catch (e) {
         console.warn("bridge snapshot (post-nav) failed", e);
@@ -172,17 +248,19 @@ async function onRun() {
     }
   }
 
-  // 4) Keep your optional arrival verification (independent of auto snapshots)
-  const snap2 = await runTool("get_page_state", {});
-  if (snap2?.ok) {
-    const url = (snap2.data?.url || "").toLowerCase();
-    if (hint?.expect_path && url.includes(hint.expect_path)) {
-      log(`** DONE: Arrived at ${hint.expect_path}`);
-    } else if (hint?.summary) {
-      log(`** SUMMARY: ${hint.summary}`);
+  // 4) Optional arrival verification (independent of auto snapshots)
+  try {
+    const snap2 = await runTool("get_page_state", {});
+    if (snap2?.ok) {
+      const url = (snap2.data?.url || "").toLowerCase();
+      if (hint?.expect_path && url.includes(hint.expect_path)) {
+        log(`** DONE: Arrived at ${hint.expect_path}`);
+      } else if (hint?.summary) {
+        log(`** SUMMARY: ${hint.summary}`);
+      }
     }
-  }
+  } catch {}
 
-  // Optional: stop tracking when all is done
+  // Optional: stop tracking
   // await chrome.runtime.sendMessage({ type: "STOP_TRACK_TAB" }).catch(() => {});
 }

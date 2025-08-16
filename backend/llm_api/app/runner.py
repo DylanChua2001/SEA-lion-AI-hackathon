@@ -4,7 +4,7 @@ from typing import Any, Dict, List
 
 from langchain_core.messages import AnyMessage, SystemMessage, HumanMessage
 from .config import SYSTEM
-from .graph import build_app_for_page
+from .supervisor import build_supervisor_app
 from .planner import messages_to_plan, done_reason
 
 SAFE_RECURSION_LIMIT = 20
@@ -32,7 +32,7 @@ def run_plan_once(goal: str, page_state: str | dict) -> dict:
     No threads, no resumption, no human-in-the-loop.
     """
     page = _coerce_page(page_state)
-    app = build_app_for_page(page)
+    app = build_supervisor_app(page)
 
     goal_text = (goal or "").strip() or "Find the Book Appointment button"
     page_url = (page.get("url") or "")

@@ -11,7 +11,7 @@ from langchain_core.messages import AnyMessage, HumanMessage, AIMessage, ToolMes
 from app.tools import build_tools
 from app.llm import make_llm
 from app.adapter import as_tool_call_ai_message
-from app.subgraphs.lab_records import build_lab_records_subgraph
+from backend.llm_api.app.subgraphs.lab.lab_records import build_lab_records_subgraph
 
 MAX_ITERATIONS = 12          # headroom for main loop
 LAB_PREP_MAX_TRIES = 8       # how many times to poll snapshot after click
