@@ -249,6 +249,37 @@ def _summarize(items: List[Dict[str, str]]) -> str:
         for it in items
     ])
 
+def _tts_list(items: List[Dict[str, str]], limit: int = 3) -> str:
+    """
+    Build a speech-friendly summary like:
+    'COVID booster on 12 March 2024, completed at Kallang Polyclinic; HPV 1st dose on 5 May 2023; and 2 more.'
+    """
+    if not items:
+        return "No immunisation records were found."
+    parts: List[str] = []
+    for it in items[:limit]:
+        vac = it.get("vaccine") or "Unknown vaccine"
+        dose = it.get("dose") or ""
+        date = it.get("date") or "unknown date"
+        status = it.get("status") or ""
+        facility = it.get("facility") or ""
+
+        seg = vac
+        if dose:
+            seg += f" {dose.lower()}"
+        seg += f" on {date}"
+        if status:
+            seg += f", {status.lower()}"
+        if facility:
+            # make it flow: ", at <facility>"
+            seg += f" at {facility}"
+        parts.append(seg)
+
+    more = len(items) - limit
+    if more > 0:
+        parts.append(f"and {more} more")
+    return "; ".join(parts) + "."
+
 # ------------- graph -------------
 class ImmReadState(TypedDict):
     messages: Annotated[List[AnyMessage], add_messages]
@@ -315,7 +346,8 @@ def build_immunisations_snapshot_reader_subgraph(page: Dict[str, Any], tools: Op
         payload = {
             "url": url,
             "count": len(items),
-            "summary": summary,
+            "summary": summary,          # UI-friendly aggregation
+            "tts": _tts_list(items),     # NEW: speech-friendly line(s)
             "items": items,
             "reason": f"Extracted {len(items)} immunisation record(s)",
             "gated": (state.get("prep_tries", 0) > 0) or (state.get("settle_tries", 0) > 0),

@@ -239,6 +239,35 @@ def _summarize(items: List[Dict[str, str]]) -> str:
         for it in items
     ])
 
+def _tts_list(items: List[Dict[str, str]], limit: int = 3) -> str:
+    """
+    Build a speech-friendly summary like:
+    '27 August 2025 at 09:10 AM, Dental Cleaning at Geylang Polyclinic; and 1 more.'
+    """
+    if not items:
+        return "No appointments were found."
+    parts: List[str] = []
+    for it in items[:limit]:
+        date = it.get("date") or "Unknown date"
+        time = it.get("time") or "unknown time"
+        proc = it.get("procedure") or ""
+        clinic = it.get("clinic") or ""
+        loc = it.get("location") or ""
+
+        seg = f"{date} at {time}"
+        if proc:
+            seg += f", {proc}"
+        if clinic:
+            seg += f" at {clinic}"
+        if loc and loc != clinic:
+            seg += f" — {loc}"
+        parts.append(seg)
+
+    more = len(items) - limit
+    if more > 0:
+        parts.append(f"and {more} more")
+    return "; ".join(parts) + "."
+
 # ------------- graph -------------
 class ApptReadState(TypedDict):
     messages: Annotated[List[AnyMessage], add_messages]
@@ -308,7 +337,8 @@ def build_appointments_snapshot_reader_subgraph(page: Dict[str, Any], tools: Opt
         payload = {
             "url": url,
             "count": len(items),
-            "summary": summary,
+            "summary": summary,          # UI-friendly
+            "tts": _tts_list(items),     # NEW: speech-friendly
             "items": items,
             "reason": f"Extracted {len(items)} appointment(s)",
             "gated": (state.get("prep_tries", 0) > 0) or (state.get("settle_tries", 0) > 0),

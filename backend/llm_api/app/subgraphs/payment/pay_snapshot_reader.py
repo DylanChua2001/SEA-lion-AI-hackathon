@@ -69,8 +69,8 @@ def _looks_structured(snap: Dict[str, Any]) -> bool:
 
 # ───────────────────────── extraction helpers ─────────────────────────
 _WS = re.compile(r"\s+")
-_MONEY_RX = re.compile(r"S\\$\s*\d{1,3}(?:,\d{3})*(?:\.\d{2})?|\bS\$\s*\d+(?:\.\d{2})?\b", re.I)
 # Accepts both "S$37.30" and potential encoded "S\$37.30" from text sources
+_MONEY_RX = re.compile(r"S\\$\s*\d{1,3}(?:,\d{3})*(?:\.\d{2})?|\bS\$\s*\d+(?:\.\d{2})?\b", re.I)
 
 def _norm(s: str) -> str:
     return _WS.sub(" ", (s or "").strip())
@@ -91,10 +91,8 @@ def _extract_note(texts: List[str]) -> str:
     while i < N:
         t = texts[i].strip()
         if t.lower().startswith("note"):
-            # Include this and subsequent non-empty lines that look like the banner content.
             out.append(_norm(t))
             j = i + 1
-            # Grab up to ~8 more lines that are not headings and not obviously nav/footer noise
             while j < min(N, i + 9):
                 line = texts[j].strip()
                 if not line:
@@ -251,6 +249,46 @@ def _extract_from_snapshot(snap: Dict[str, Any]) -> Dict[str, Any]:
         "count": len(clusters),
     }
 
+# ───────────────────────── TTS helpers ─────────────────────────
+def _clean_amount(a: str) -> str:
+    # normalize "S\$" → "S$", collapse spaces
+    return _norm((a or "").replace("\\", ""))
+
+def _tts_from_clusters(clusters: List[Dict[str, str]], note: str, limit: int = 3) -> str:
+    """
+    Produce a short, speech-friendly sentence:
+      - 'No outstanding bills.'
+      - 'Outstanding bills: NHG, S$37.30; SingHealth, S$0.00; and 1 more. Note: ...'
+    """
+    if not clusters:
+        base = "No outstanding bills."
+        if note:
+            # keep the note short to avoid long reads
+            trimmed = (note[:180] + "…") if len(note) > 180 else note
+            return f"{base} {trimmed}"
+        return base
+
+    parts: List[str] = []
+    for c in clusters[:limit]:
+        name = (c.get("cluster") or "Unknown cluster").strip()
+        amt = _clean_amount(c.get("amount") or "")
+        if amt:
+            parts.append(f"{name}, {amt}")
+        else:
+            parts.append(f"{name}")
+
+    more = len(clusters) - limit
+    prefix = "Outstanding bills: " if any((c.get('amount') or "").strip() not in {"", "S$0.00", "S$0", "S$0.0"} for c in clusters) else "Bills by cluster: "
+    spoken = "; ".join(parts)
+    if more > 0:
+        spoken += f"; and {more} more"
+
+    # Optionally append a short note if present
+    if note:
+        trimmed = (note[:160] + "…") if len(note) > 160 else note
+        return f"{prefix}{spoken}. {trimmed}"
+    return f"{prefix}{spoken}."
+
 # ───────────────────────── graph ─────────────────────────
 class PayReadState(TypedDict):
     messages: Annotated[List[AnyMessage], add_messages]
@@ -317,9 +355,11 @@ def build_payments_snapshot_reader_subgraph(page: Dict[str, Any], tools: Optiona
 
         # Extract & finish
         extracted = _extract_from_snapshot(snap)
+        tts = _tts_from_clusters(extracted.get("clusters", []), extracted.get("note", ""))
         payload = {
             "url": url,
             **extracted,
+            "tts": tts,  # NEW: speech-friendly one-liner(s)
             "reason": f"Extracted {extracted.get('count', 0)} cluster bill item(s)",
             "gated": (state.get("prep_tries", 0) > 0) or (state.get("settle_tries", 0) > 0),
             "prep_tries": state.get("prep_tries", 0),

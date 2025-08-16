@@ -63,11 +63,11 @@ def _is_lab_url(url: Optional[str]) -> bool:
     return (TARGET_HOST in u) and (LAB_URL_TOKEN in u)
 
 def _looks_structured(snap: Dict[str, Any]) -> bool:
-    links = snap.get("links") or []
-    headings = snap.get("headings") or []
+    links = snap.get("links") or {}
+    headings = snap.get("headings") or {}
     return (len(headings) >= MIN_HEADINGS) and (len(links) >= MIN_LINKS)
 
-# ------------- extraction helpers (unchanged logic) -------------
+# ------------- extraction helpers -------------
 _LABELS = {"date:", "ordering facility:", "performing facility:"}
 _IRRELEVANT_EXACT = {
     "log out","healthier sg","health a-z","live healthy","mental wellbeing","parent hub",
@@ -150,11 +150,28 @@ def _summarize(items: List[Dict[str, str]]) -> str:
         for it in items
     ])
 
+def _tts_list(items: List[Dict[str, str]], limit: int = 3) -> str:
+    if not items:
+        return "No lab items were found."
+    parts = []
+    for it in items[:limit]:
+        name = it.get("test_name") or "Unknown test"
+        date = it.get("date") or "unknown date"
+        ord_fac = it.get("ordering_facility") or ""
+        segs = [f"{name} on {date}"]
+        if ord_fac:
+            segs.append(f"from {ord_fac}")
+        parts.append(", ".join(segs))
+    more = len(items) - limit
+    if more > 0:
+        parts.append(f"and {more} more")
+    return "; ".join(parts) + "."
+
 # ------------- graph -------------
 class LabReadState(TypedDict):
     messages: Annotated[List[AnyMessage], add_messages]
     prep_tries: int          # polls spent waiting for URL token
-    settle_tries: int        # extra polls after token to let DOM settle
+    settle_tries: int        # extra polls after URL token to let DOM settle
     initial_wait_done: bool  # applied LAB_GATE_INITIAL_MS once
 
 def build_lab_snapshot_reader_subgraph(page: Dict[str, Any], tools: Optional[List] = None):
@@ -220,7 +237,8 @@ def build_lab_snapshot_reader_subgraph(page: Dict[str, Any], tools: Optional[Lis
         payload = {
             "url": url,
             "count": len(items),
-            "summary": summary,
+            "summary": summary,          # UI-friendly
+            "tts": _tts_list(items),     # NEW: TTS-friendly
             "items": items,
             "reason": f"Extracted {len(items)} lab item(s)",
             "gated": (state.get("prep_tries", 0) > 0) or (state.get("settle_tries", 0) > 0),

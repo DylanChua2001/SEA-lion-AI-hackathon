@@ -35,10 +35,10 @@ function log(m) {
   el.textContent += m + "\n";
   el.scrollTop = el.scrollHeight;
 
-  // Only send specific user-facing lines to TTS
+  // Speak ONLY lines explicitly marked for TTS (***), stripping the asterisks
   if (m.startsWith("***")) {
-    const spoken = m.replace(/^\*+/, "").trim();  // remove leading ***
-    speakText(spoken);
+    const spoken = m.replace(/^\*+/, "").trim();
+    if (spoken) speakText(spoken);
   }
 }
 
@@ -220,6 +220,10 @@ async function runOnce({ tabId, goal, label = "pass" }) {
 
     if (tool === "done" || tool === "fail") {
       log(`** ${tool.toUpperCase()}: ${JSON.stringify(args || {})}`);
+      // Speak only the backend-provided TTS string (if present) for DONE
+      if (tool === "done" && args && typeof args.tts === "string" && args.tts.trim()) {
+        speakText(args.tts.trim());
+      }
       break;
     }
 
@@ -303,6 +307,7 @@ async function onRun() {
 
   const needLogin = looksLikeSingpass(seeded) || !looksLoggedIn(seeded);
   if (needLogin) {
+    // Mark this as TTS-eligible with ***; TTS will strip the asterisks
     log("*** Please log in with Singpass in the tab, then click ‘Run Agent’ again.");
     return;
   }
