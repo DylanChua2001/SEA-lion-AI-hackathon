@@ -3,14 +3,46 @@ const API = "http://127.0.0.1:8001"; // FastAPI
 const TTS_API = "http://127.0.0.1:8000";
 const LAB_URL_TOKEN = "/lab-test-reports/lab"; // used to confirm arrival
 
+/* ------------------------- Language detection (prompt-based) ------------------------- */
+// Return both a human label (for translate_to) and a TTS code (for lang).
+function detectLangFromPrompt(text = "") {
+  const s = String(text || "").trim();
+
+  // Script-based (very reliable)
+  if (/[一-鿿㐀-䶵]/u.test(s)) return { label: "Chinese", tts: "zh" };   // CJK
+  if (/[\u0B80-\u0BFF]/u.test(s)) return { label: "Tamil", tts: "ta" }; // Tamil
+
+  // Malay heuristics (Latin script)
+  const lower = s.toLowerCase();
+  const malayHints = ["sila", "klik", "log masuk", "kemudian", "sekali lagi", "dengan", "dan", "anda"];
+  if (malayHints.some(h => lower.includes(h))) return { label: "Malay", tts: "ms" };
+
+  // Optional: add more if you support them in TTS (e.g., Indonesian, Tagalog)
+  // if (lower.includes("selamat pagi")) return { label: "Indonesian", tts: "id" };
+
+  // Default English
+  return { label: "English", tts: "en" };
+}
+
+// Session-preferred language, decided from the user's initial prompt.
+let PREFERRED_LANG = { label: "English", tts: "en" };
+
 /* ------------------------- TTS helpers ------------------------- */
 
 async function speakText(text) {
   try {
+    const body = {
+      text,
+      // Ask backend to translate into the user’s prompt language,
+      // and synthesize in that same language’s voice:
+      translate_to: PREFERRED_LANG.label,
+      lang: PREFERRED_LANG.tts,
+    };
+
     const res = await fetch(`${TTS_API}/speak`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text })
+      body: JSON.stringify(body)
     });
     if (!res.ok) throw new Error("TTS request failed");
 
@@ -21,7 +53,7 @@ async function speakText(text) {
     if (player) {
       player.src = url;
       player.style.display = "block";
-      player.play().catch(() => { });  // autoplay may require user gesture
+      player.play().catch(() => {}); // autoplay may require user gesture
     }
   } catch (e) {
     console.error("speakText error", e);
@@ -220,7 +252,7 @@ async function runOnce({ tabId, goal, label = "pass" }) {
 
     if (tool === "done" || tool === "fail") {
       log(`** ${tool.toUpperCase()}: ${JSON.stringify(args || {})}`);
-      // Speak only the backend-provided TTS string (if present) for DONE
+      // Speak only the backend-provided TTS string (if present) for DONE — in the user’s prompt language
       if (tool === "done" && args && typeof args.tts === "string" && args.tts.trim()) {
         speakText(args.tts.trim());
       }
@@ -298,6 +330,9 @@ async function onRun() {
   const rawGoal = (document.getElementById("goal")?.value || "view lab results").trim();
   const goal = sanitizeGoal(rawGoal);
 
+  // Detect and set session language from the user’s initial prompt
+  PREFERRED_LANG = detectLangFromPrompt(rawGoal);
+
   log("Sending to backend (one-shot): initiating pass 1 (navigate)");
   await runOnce({ tabId: tab.id, goal, label: "pass1:navigate" });
 
@@ -307,7 +342,7 @@ async function onRun() {
 
   const needLogin = looksLikeSingpass(seeded) || !looksLoggedIn(seeded);
   if (needLogin) {
-    // Mark this as TTS-eligible with ***; TTS will strip the asterisks
+    // TTS-eligible prompt; will be translated + spoken in the prompt’s language
     log("*** Please log in with Singpass in the tab, then click ‘Run Agent’ again.");
     return;
   }
