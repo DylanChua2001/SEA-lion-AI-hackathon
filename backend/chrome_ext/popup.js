@@ -1,11 +1,45 @@
 // popup.js
 const API = "http://127.0.0.1:8001"; // FastAPI
+const TTS_API = "http://127.0.0.1:8000";
 const LAB_URL_TOKEN = "/lab-test-reports/lab"; // used to confirm arrival
+
+/* ------------------------- TTS helpers ------------------------- */
+
+async function speakText(text) {
+  try {
+    const res = await fetch(`${TTS_API}/speak`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text })
+    });
+    if (!res.ok) throw new Error("TTS request failed");
+
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+
+    const player = document.getElementById("tts-player");
+    if (player) {
+      player.src = url;
+      player.style.display = "block";
+      player.play().catch(() => { });  // autoplay may require user gesture
+    }
+  } catch (e) {
+    console.error("speakText error", e);
+  }
+}
+
+/* ------------------------- Logging ------------------------- */
 
 function log(m) {
   const el = document.getElementById("log");
   el.textContent += m + "\n";
   el.scrollTop = el.scrollHeight;
+
+  // Only send specific user-facing lines to TTS
+  if (m.startsWith("***")) {
+    const spoken = m.replace(/^\*+/, "").trim();  // remove leading ***
+    speakText(spoken);
+  }
 }
 
 async function getActiveTab() {
@@ -128,22 +162,18 @@ async function seedBridgeWithCurrent(tabId) {
 function looksLoggedIn(snap) {
   if (!snap || typeof snap !== "object") return false;
 
-  // Preferred: server-style session flag
   if (snap.session && snap.session.is_authenticated === true) return true;
 
-  // From content.js flags (derived from inline scripts/DOM)
   const flags = snap.flags || {};
-  if (flags.sslIsAnonymous === "True") return false;          // explicitly anonymous
-  if (flags.hasLoginButton === true) return false;            // visible login affordance
+  if (flags.sslIsAnonymous === "True") return false;
+  if (flags.hasLoginButton === true) return false;
 
-  // Text hints (top_* arrays)
   const list = (x) => (Array.isArray(x) ? x.map((t) => String(t).toLowerCase()) : []);
   const tb = list(snap.top_buttons);
   const tl = list(snap.top_links);
   const th = list(snap.top_headings);
   if (tb.concat(tl, th).some(t => /logout|my profile|welcome|^hi\s/.test(t))) return true;
 
-  // URL sanity: on eServices and not on any 'login' path
   const url = String(snap.url || "").toLowerCase();
   if (url.includes("eservices.healthhub.sg") && !/login/.test(url) && flags.hasLoginButton !== true) return true;
 
@@ -160,15 +190,13 @@ function looksLikeSingpass(snap) {
 /* ------------------------- Core: one planning+execution pass ------------------------- */
 
 async function runOnce({ tabId, goal, label = "pass" }) {
-  // 1) Snapshot & seed the server before planning
   const snap = await runTool(tabId, "get_page_state", {});
   if (!snap?.ok) { log(`[${label}] snapshot failed: ${JSON.stringify(snap)}`); return { ok: false }; }
   const page_state = snap.data;
-  await postSnapshot(page_state).catch(() => {});
+  await postSnapshot(page_state).catch(() => { });
 
   log(`[${label}] Sending to backend: current_url=${page_state.url}`);
 
-  // 2) Request stateless plan
   const planRes = await fetch(`${API}/agent/run`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -181,10 +209,9 @@ async function runOnce({ tabId, goal, label = "pass" }) {
 
   const planPayload = await planRes.json();
   const steps = Array.isArray(planPayload?.steps) ? planPayload.steps : [];
-  const hint  = planPayload?.hint || {};
+  const hint = planPayload?.hint || {};
   log(`[${label}] Plan received: ${steps.length} steps`);
 
-  // 3) Execute steps locally
   let lastFindTop = null;
 
   for (const step of steps) {
@@ -205,26 +232,24 @@ async function runOnce({ tabId, goal, label = "pass" }) {
       lastFindTop = obs.data.matches[0] || null;
     }
 
-    // Fallbacks for click → nav
     if (execTool === "click" && (!obs?.ok || obs?.data?.error === "element not found")) {
       if (lastFindTop?.href) {
         log(`.. CLICK fallback: navigating to ${lastFindTop.href}`);
-        await chrome.tabs.update(tabId, { url: lastFindTop.href }).catch(() => {});
+        await chrome.tabs.update(tabId, { url: lastFindTop.href }).catch(() => { });
         obs = { ok: true, data: { navigating: lastFindTop.href } };
       }
     }
     if (execTool === "click" && obs?.ok && !obs.data?.navigating && lastFindTop?.href) {
       log(`.. CLICK no nav; forcing nav to ${lastFindTop.href}`);
-      await chrome.tabs.update(tabId, { url: lastFindTop.href }).catch(() => {});
+      await chrome.tabs.update(tabId, { url: lastFindTop.href }).catch(() => { });
       obs = { ok: true, data: { navigating: lastFindTop.href } };
     }
     if (execTool === "click" && obs?.ok && obs.data?.navigate_to) {
-      await chrome.tabs.update(tabId, { url: obs.data.navigate_to }).catch(() => {});
+      await chrome.tabs.update(tabId, { url: obs.data.navigate_to }).catch(() => { });
       obs = { ok: true, data: { navigating: obs.data.navigate_to } };
       log(`.. NAV via chrome.tabs.update -> ${obs.data.navigating}`);
     }
 
-    // If we navigated, wait, re-inject tools, idle, then seed the bridge
     const navigated = (execTool === "nav") || (obs?.ok && (obs.data?.navigating || obs.data?.href));
     if (navigated) {
       await waitForTabNavigation(tabId);
@@ -234,7 +259,6 @@ async function runOnce({ tabId, goal, label = "pass" }) {
     }
   }
 
-  // 4) Arrival / summary hint
   try {
     const snap2 = await runTool(tabId, "get_page_state", {});
     if (snap2?.ok) {
@@ -245,7 +269,7 @@ async function runOnce({ tabId, goal, label = "pass" }) {
         log(`** SUMMARY: ${hint.summary}`);
       }
     }
-  } catch {}
+  } catch { }
 
   return { ok: true };
 }
@@ -256,14 +280,11 @@ async function onRun() {
   const tab = await getActiveTab();
   if (!tab) return log("No active tab");
 
-  // Track this tab (so background auto-snapshots on nav & SPA routes)
-  await chrome.runtime.sendMessage({ type: "START_TRACK_TAB", tabId: tab.id }).catch(() => {});
+  await chrome.runtime.sendMessage({ type: "START_TRACK_TAB", tabId: tab.id }).catch(() => { });
 
-  // Always start from HealthHub home
   await chrome.tabs.update(tab.id, { url: "https://www.healthhub.sg/" });
   await waitForTabNavigation(tab.id);
 
-  // Inject tools and check backend health
   await injectTools(tab.id);
   if (!/^https?:\/\//.test(tab.url || "")) return log("Open a normal webpage first.");
   const h = await fetch(`${API}/health`).then(r => r.json()).catch(e => ({ error: String(e) }));
@@ -273,23 +294,19 @@ async function onRun() {
   const rawGoal = (document.getElementById("goal")?.value || "view lab results").trim();
   const goal = sanitizeGoal(rawGoal);
 
-  // PASS 1: navigate (supervisor will route to `lab` and END)
   log("Sending to backend (one-shot): initiating pass 1 (navigate)");
   await runOnce({ tabId: tab.id, goal, label: "pass1:navigate" });
 
-  // Ensure we seed the latest DOM after any final nav churn
   await injectTools(tab.id);
   await runTool(tab.id, "wait_for_idle", { quietMs: 700, timeout: 8000 });
   const seeded = await seedBridgeWithCurrent(tab.id);
 
-  // -------- Login gate between passes --------
   const needLogin = looksLikeSingpass(seeded) || !looksLoggedIn(seeded);
   if (needLogin) {
-    log("🔐 Please log in with Singpass in the tab, then click ‘Run Agent’ again.");
-    return; // stop here — user logs in, then re-runs
+    log("*** Please log in with Singpass in the tab, then click ‘Run Agent’ again.");
+    return;
   }
 
-  // PASS 2: Reader (router will jump to *_read automatically when already on target URL)
   const nowUrl = (seeded?.url || "").toLowerCase();
   const onLabPage = nowUrl.includes(LAB_URL_TOKEN);
   log(onLabPage
@@ -297,7 +314,4 @@ async function onRun() {
     : "Auto two-step: running pass 2; router will choose the correct reader…");
 
   await runOnce({ tabId: tab.id, goal, label: "pass2:read" });
-
-  // Optional: stop tracking the tab afterwards
-  // await chrome.runtime.sendMessage({ type: "STOP_TRACK_TAB" }).catch(() => {});
 }
