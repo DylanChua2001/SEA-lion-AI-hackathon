@@ -1,9 +1,11 @@
 services:
-  speech_to_text_api:
+  stt_backend:
     build:
       context: ./backend/speech_to_text_api
     ports:
       - "8000:8000"
+    env_file:
+      - ./backend/speech_to_text_api/.env
     environment:
       - PYTHONUNBUFFERED=1
     develop:
@@ -12,7 +14,44 @@ services:
           target: /app
           action: sync
 
-  text_to_speech_api:
+  tts_backend:
+    build:
+      context: ./backend/speech_to_text_api
+    ports:
+      - "8001:8001"
+    env_file:
+      - ./backend/text_to_speech_api/.env
+    environment:
+      - PYTHONUNBUFFERED=1
+    develop:
+      watch:
+        - path: ./backend/speech_to_text_api
+          target: /app
+          action: sync
+
+  stt_frontend:
+    build:
+      context: ./frontend/speech_to_text
+    ports:
+      - "8080:80"
+    develop:
+      watch:
+        - path: ./frontend/speech_to_text
+          target: /usr/share/nginx/html
+          action: sync
+
+  tts_frontend:
+    build:
+      context: ./frontend/text_to_speech
+    ports:
+      - "8081:80"
+    develop:
+      watch:
+        - path: ./frontend/text_to_speech
+          target: /usr/share/nginx/html
+          action: sync
+
+  llm_api:
     build:
       context: ./backend/text_to_speech_api
     ports:
@@ -25,39 +64,19 @@ services:
           target: /app
           action: sync
 
-  # llm_api:
-  #   build:
-  #     context: ./backend/llm_api
-  #   ports:
-  #     - "8001:8000"
-  #   env_file:
-  #     - ./backend/llm_api/.env
-  #   environment:
-  #     - PYTHONUNBUFFERED=1
-  #   develop:
-  #     watch:
-  #       - path: ./backend/llm_api
-  #         target: /app
-  #         action: sync
-
-  speech_to_text_frontend:
+  # ───────── NEW: Sea Lion Chat API ─────────
+  chat_api:
     build:
-      context: ./frontend/speech_to_text
+      context: ./backend/chat_api
     ports:
-      - "8080:80"
+      - "8003:8000"
+    env_file:
+      - ./backend/chat_api/.env
+    environment:
+      - PYTHONUNBUFFERED=1
     develop:
       watch:
-        - path: ./frontend/speech_to_text
-          target: /usr/share/nginx/html
+        - path: ./backend/chat_api
+          target: /app
           action: sync
-
-  text_to_speech_frontend:
-    build:
-      context: ./frontend/text_to_speech
-    ports:
-      - "8081:80"
-    develop:
-      watch:
-        - path: ./frontend/text_to_speech
-          target: /usr/share/nginx/html
-          action: sync
+    restart: unless-stopped

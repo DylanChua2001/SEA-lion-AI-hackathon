@@ -1,12 +1,97 @@
 # app/tools.py
-import json, re
-from typing import Optional, List
+from __future__ import annotations
+
+import json
+import re
+import time
+import threading
+from typing import Any, Dict, List, Optional
+
 from pydantic import BaseModel, Field
 from langchain_core.tools import StructuredTool
 
 
-def build_tools(page: dict) -> List[StructuredTool]:
-    # ── Schemas ───────────────────────────────────────────────────────────────
+# ────────────────────────── Bridge: latest page snapshot ─────────────────────
+# The Chrome extension/background should POST its fresh snapshot to a FastAPI
+# endpoint which calls set_latest_snapshot(). Graph tools can then read it.
+
+_BRIDGE_LOCK = threading.Lock()
+# Store as a dict with {"snap": <snapshot dict>, "ts": <float>} to support
+# sticky upgrades and prevent lower-quality pages from overwriting better ones.
+_LATEST_SNAPSHOT: Optional[Dict[str, Any]] = None
+
+
+def _rank_url(url: Optional[str]) -> int:
+    """Higher rank is 'better'. Prefer specific Lab page over generic Home."""
+    u = (url or "").lower()
+    if "/lab-test-reports/lab" in u:
+        return 3
+    if "eservices.healthhub.sg" in u:
+        return 2
+    if "healthhub.sg" in u:
+        return 1
+    return 0
+
+
+def set_latest_snapshot(snap: Dict[str, Any]) -> None:
+    """Server endpoint calls this to publish the newest browser snapshot.
+
+    Sticky upgrade policy:
+      - Accept if the new snapshot is *newer in time* AND not a downgrade in rank.
+      - Otherwise keep the existing one.
+    """
+    global _LATEST_SNAPSHOT
+    now = time.time()
+    new_url = (snap or {}).get("url")
+    new_rank = _rank_url(new_url)
+
+    with _BRIDGE_LOCK:
+        prev = _LATEST_SNAPSHOT or {}
+        prev_snap = prev.get("snap") or {}
+        prev_ts = float(prev.get("ts") or 0)
+        prev_url = prev_snap.get("url")
+        prev_rank = _rank_url(prev_url)
+
+        accept = (now >= prev_ts) and (new_rank >= prev_rank)
+        if accept:
+            _LATEST_SNAPSHOT = {"snap": snap, "ts": now}
+            try:
+                print(f"[bridge] ACCEPT {new_url} (rank {new_rank}) ts={now}")
+            except Exception:
+                pass
+        else:
+            try:
+                print(
+                    f"[bridge] DROP   {new_url} (rank {new_rank}) ts={now}  — kept {prev_url} "
+                    f"(rank {prev_rank}) ts={prev_ts}"
+                )
+            except Exception:
+                pass
+
+
+def get_latest_snapshot() -> Optional[Dict[str, Any]]:
+    with _BRIDGE_LOCK:
+        if not _LATEST_SNAPSHOT:
+            return None
+        # return a shallow copy to avoid accidental mutation by callers
+        snap = _LATEST_SNAPSHOT.get("snap") or {}
+        return snap.copy()
+
+
+# ────────────────────────── Tool factory ─────────────────────────────────────
+def build_tools(page: Dict[str, Any]) -> List[StructuredTool]:
+    """
+    Return the toolset used by graphs/subgraphs.
+
+    Includes:
+      - find, click, type (proxy; read-only over initial `page`)
+      - wait (supports {seconds} or {ms})
+      - wait_for_idle (server-side timed pause)
+      - get_page_state (reads latest snapshot from bridge; fallback to `page`)
+      - done
+    """
+
+    # ── Pydantic schemas (input models) ──────────────────────────────────────
     class FindInput(BaseModel):
         query: str = Field(..., description="Text to search in labels/link text/selectors")
 
@@ -18,12 +103,22 @@ def build_tools(page: dict) -> List[StructuredTool]:
         text: str
 
     class WaitInput(BaseModel):
-        seconds: int = Field(..., ge=0, le=60, description="How long to wait (seconds)")
+        # Support either seconds or ms; both optional, at least one should be provided
+        seconds: Optional[int] = Field(default=None, ge=0, le=60, description="How long to wait (seconds)")
+        ms: Optional[int] = Field(default=None, ge=0, le=60000, description="How long to wait (milliseconds)")
+
+    class WaitIdleInput(BaseModel):
+        quietMs: Optional[int] = Field(default=600, ge=0, le=60000)
+        timeout: Optional[int] = Field(default=3000, ge=0, le=180000)
 
     class DoneInput(BaseModel):
         reason: str
 
-    # ── Helpers ───────────────────────────────────────────────────────────────
+    class EmptyInput(BaseModel):
+        """Schema for tools with no args (e.g., get_page_state)."""
+        pass
+
+    # ── Helpers for proxy find() over the *provided* `page` snapshot ─────────
     def _canon(s: str) -> str:
         return re.sub(r"[^a-z0-9]+", " ", (s or "").lower()).strip()
 
@@ -32,11 +127,11 @@ def build_tools(page: dict) -> List[StructuredTool]:
         B = set(_canon(b).split())
         return len(A & B)
 
-    def _search(q: str):
+    def _search(q: str) -> List[Dict[str, Any]]:
         ql = _canon(q)
-        out = []
+        out: List[Dict[str, Any]] = []
 
-        def add(kind, item):
+        def add(kind: str, item: Dict[str, Any]) -> None:
             out.append({
                 "kind": kind,
                 "text": item.get("text") or item.get("name") or "",
@@ -51,56 +146,47 @@ def build_tools(page: dict) -> List[StructuredTool]:
             sl = _canon(selector)
             if ql in tl or ql in sl:
                 return True
-            # token overlap heuristic
             return _overlap(ql, tl) > 0
 
-        for b in page.get("buttons", []):
+        for b in page.get("buttons", []) or []:
             if matches(b.get("text", ""), b.get("selector", "")):
                 add("button", b)
-        for a in page.get("links", []):
+        for a in page.get("links", []) or []:
             if matches(a.get("text", ""), a.get("selector", "")):
                 add("link", a)
-        for i in page.get("inputs", []):
+        for i in page.get("inputs", []) or []:
             hay = " ".join([i.get("name", ""), i.get("placeholder", ""), i.get("selector", "")]).lower()
             if ql and ql in hay:
                 add("input", i)
 
-        # light scoring: prefer more overlap, then shorter selectors
-        def score(item):
-            ov = _overlap(ql, item["text"])
-            return (ov, -len(item.get("selector", "")))
+        def score(item: Dict[str, Any]):
+            ov = _overlap(ql, item.get("text", ""))
+            return (ov, -len(item.get("selector", "") or ""))
+
         out.sort(key=score, reverse=True)
         return out
 
-    # ── Tool impls ────────────────────────────────────────────────────────────
+    # ── Tool impls (return JSON strings; graphs parse ToolMessage.content) ───
     def find_func(query: str) -> str:
         matches = _search(query)
-        # Up to 6 so the graph can enumerate clear choices
         return json.dumps({"matches": matches[:6], "total": len(matches)})
 
     def click_func(selector: str) -> str:
-        # Collect known selectors (optional sanity)
-        buttons = page.get("buttons", [])
-        links   = page.get("links", [])
-        all_sel = {*(x.get("selector", "") for x in buttons), *(x.get("selector", "") for x in links)}
-
-        # If it's a link, surface its href in case the client wants to navigate
+        links = page.get("links", []) or []
         nav = None
         for a in links:
             if a.get("selector", "") == selector and a.get("href"):
                 nav = a.get("href")
                 break
-
-        # Always ok=True for proxy click; navigation (if any) is indicated separately
         return json.dumps({
             "ok": True,
             "selector": selector,
-            "navigate_to": nav,   # harmless; graph may ignore it
+            "navigate_to": nav,  # client can decide to navigate
             "note": "proxy-click"
         })
 
     def type_func(selector: str, text: str) -> str:
-        all_sel = {x.get("selector", "") for x in page.get("inputs", [])}
+        all_sel = {x.get("selector", "") for x in (page.get("inputs", []) or [])}
         return json.dumps({
             "ok": (selector in all_sel) or not all_sel,
             "selector": selector,
@@ -108,18 +194,84 @@ def build_tools(page: dict) -> List[StructuredTool]:
             "note": "proxy-type"
         })
 
-    def wait_func(seconds: int) -> str:
-        # Client/browser should perform the real wait; this is an acknowledgment
-        return json.dumps({"ok": True, "waited": int(seconds)})
+    def wait_func(seconds: Optional[int] = None, ms: Optional[int] = None) -> str:
+        wait_ms = 0
+        if isinstance(seconds, int):
+            wait_ms = max(wait_ms, min(seconds, 60) * 1000)
+        if isinstance(ms, int):
+            wait_ms = max(wait_ms, min(ms, 60_000))
+        if wait_ms > 0:
+            time.sleep(wait_ms / 1000.0)
+        return json.dumps({"ok": True, "waited": wait_ms})
+
+    def wait_for_idle_func(quietMs: Optional[int] = 600, timeout: Optional[int] = 3000) -> str:
+        # Server cannot detect real browser idleness; we simulate a small pause.
+        slept = max(0, min(int(quietMs or 0), int(timeout or 0), 60_000))
+        if slept:
+            time.sleep(slept / 1000.0)
+        return json.dumps({"idle": True, "slept_ms": slept})
+
+    def get_page_state_func() -> str:
+        """
+        Return the latest extension-provided snapshot if available; otherwise
+        fallback to the initial `page` this toolset was built with.
+        """
+        snap = get_latest_snapshot() or page or {}
+        try:
+            src = "bridge" if get_latest_snapshot() else "fallback"
+            print(f"[get_page_state] {src} {snap.get('url')}")
+        except Exception:
+            pass
+        return json.dumps(snap)
 
     def done_func(reason: str) -> str:
         return json.dumps({"done": True, "reason": reason})
 
-    # ── Export ONLY the minimal set ───────────────────────────────────────────
+    # ── Export tools ─────────────────────────────────────────────────────────
     return [
-        StructuredTool.from_function(find_func,  name="find",  description="List candidate page elements/selectors", args_schema=FindInput),
-        StructuredTool.from_function(click_func, name="click", description="Click an element by selector (proxy)",   args_schema=ClickInput),
-        StructuredTool.from_function(type_func,  name="type",  description="Type into an input by selector (proxy)",args_schema=TypeInput),
-        StructuredTool.from_function(wait_func,  name="wait",  description="Wait for N seconds (proxy)",             args_schema=WaitInput),
-        StructuredTool.from_function(done_func,  name="done",  description="Call when the goal is achieved",         args_schema=DoneInput),
+        # Main-agent proxies
+        StructuredTool.from_function(
+            find_func,
+            name="find",
+            description="List candidate page elements/selectors from the current (cached) snapshot",
+            args_schema=FindInput,
+        ),
+        StructuredTool.from_function(
+            click_func,
+            name="click",
+            description="Proxy click by selector; returns navigate_to if the selector is an <a>",
+            args_schema=ClickInput,
+        ),
+        StructuredTool.from_function(
+            type_func,
+            name="type",
+            description="Proxy type into an input by selector",
+            args_schema=TypeInput,
+        ),
+        StructuredTool.from_function(
+            wait_func,
+            name="wait",
+            description="Pause execution; accepts either {seconds} or {ms}",
+            args_schema=WaitInput,
+        ),
+        StructuredTool.from_function(
+            wait_for_idle_func,
+            name="wait_for_idle",
+            description="Server-side idle simulation; sleeps briefly to let SPA settle",
+            args_schema=WaitIdleInput,
+        ),
+
+        # Subgraph-required tools
+        StructuredTool.from_function(
+            get_page_state_func,
+            name="get_page_state",
+            description="Return the freshest DOM snapshot pushed by the extension; fallback to initial page",
+            args_schema=EmptyInput,
+        ),
+        StructuredTool.from_function(
+            done_func,
+            name="done",
+            description="Call when the goal is achieved / terminal message with a reason string",
+            args_schema=DoneInput,
+        ),
     ]
