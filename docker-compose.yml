@@ -1,9 +1,10 @@
 services:
+  # ───────── Speech-to-Text API ─────────
   stt_backend:
     build:
       context: ./backend/speech_to_text_api
     ports:
-      - "8000:8000"
+      - "8002:8000"        # run STT on :8002 externally, maps to uvicorn 8000 inside
     env_file:
       - ./backend/speech_to_text_api/.env
     environment:
@@ -14,21 +15,23 @@ services:
           target: /app
           action: sync
 
+  # ───────── Text-to-Speech API ─────────
   tts_backend:
     build:
-      context: ./backend/speech_to_text_api
+      context: ./backend/text_to_speech_api
     ports:
-      - "8001:8001"
+      - "8000:8000"        # external :8000 for TTS
     env_file:
       - ./backend/text_to_speech_api/.env
     environment:
       - PYTHONUNBUFFERED=1
     develop:
       watch:
-        - path: ./backend/speech_to_text_api
+        - path: ./backend/text_to_speech_api
           target: /app
           action: sync
 
+  # ───────── STT Frontend ─────────
   stt_frontend:
     build:
       context: ./frontend/speech_to_text
@@ -40,6 +43,7 @@ services:
           target: /usr/share/nginx/html
           action: sync
 
+  # ───────── TTS Frontend ─────────
   tts_frontend:
     build:
       context: ./frontend/text_to_speech
@@ -51,20 +55,23 @@ services:
           target: /usr/share/nginx/html
           action: sync
 
+  # ───────── LLM Agent API ─────────
   llm_api:
     build:
-      context: ./backend/text_to_speech_api
+      context: ./backend/llm_api
     ports:
-      - "8001:8001"
+      - "8001:8000"
+    env_file:
+      - ./backend/llm_api/.env
     environment:
       - PYTHONUNBUFFERED=1
     develop:
       watch:
-        - path: ./backend/text_to_speech_api
+        - path: ./backend/llm_api
           target: /app
           action: sync
 
-  # ───────── NEW: Sea Lion Chat API ─────────
+  # ───────── Chat API ─────────
   chat_api:
     build:
       context: ./backend/chat_api
