@@ -1,8 +1,11 @@
 // popup.js
 const API = "http://127.0.0.1:8001";      // llm_api (agent/run, health, bridge)
-const CHAT_API = "http://127.0.0.1:8003";  // chat_api (/chat/simple)
+const CHAT_API = "http://127.0.0.1:8003";  // chat_api (/chat)
 const TTS_API = "http://127.0.0.1:8000";   // tts_backend (/speak)
 const LAB_URL_TOKEN = "/lab-test-reports/lab"; // used to confirm arrival
+
+// Speech-to-text backend (FastAPI /transcribe)
+const STT_API = "http://127.0.0.1:8002";   // stt_backend (/transcribe)
 
 /* ------------------------- Language detection (prompt-based) ------------------------- */
 // Return both a human label (for translate_to) and a TTS code (for lang).
@@ -29,22 +32,15 @@ let PREFERRED_LANG = { label: "English", tts: "en" };
 
 async function speakText(text) {
   try {
-    const body = {
-      text,
-      translate_to: PREFERRED_LANG.label,
-      lang: PREFERRED_LANG.tts,
-    };
-
+    const body = { text, translate_to: PREFERRED_LANG.label, lang: PREFERRED_LANG.tts };
     const res = await fetch(`${TTS_API}/speak`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body)
     });
     if (!res.ok) throw new Error("TTS request failed");
-
     const blob = await res.blob();
     const url = URL.createObjectURL(blob);
-
     const player = document.getElementById("tts-player");
     if (player) {
       player.src = url;
@@ -64,7 +60,6 @@ function log(m) {
     el.textContent += m + "\n";
     el.scrollTop = el.scrollHeight;
   }
-
   // Speak ONLY lines explicitly marked for TTS (***), stripping the asterisks
   if (m.startsWith("***")) {
     const spoken = m.replace(/^\*+/, "").trim();
@@ -96,47 +91,32 @@ function decideIntent(rawGoal = "") {
   const mentionsHealthHub = /\bhealthhub\b/.test(t);
 
   // ---------------- EN / MALAY (Latin) ----------------
-  // Verbs indicating action
   const verbsLatin = /(view|see|check|show|get|open|read|look up|access|pay|make payment|settle|see payment|see bill|bayar|buat pembayaran|lihat|semak|buka|akses)/;
-
-  // Nouns for target record types
   const nounsLatin = /(appointment(s)?|temujanji|lab( results?| report(s)?)?|makmal|result(s)?|laporan|keputusan|immuni[sz]ation(s)?|imunisasi|vaccin(e|ation)(s)?|vaksin|payment(s)?|pembayaran|bayaran|bill(s)?|bil|record(s)?|rekod)/;
 
   // ---------------- CHINESE ----------------
-  // Simplified + Traditional variants included
   const zh = /(化验|化驗|检验|檢驗|报告|報告|结果|結果|预约|預約|挂号|掛號|免疫|疫苗|付款|缴费|繳費|账单|賬單|账款|賬款|健康|记录|記錄)/;
 
   // ---------------- TAMIL ----------------
-  // Common terms (mix of native + loanwords)
   const ta = /(அப்பாயின்மெண்ட்|நியமனம்|முன்பதிவு|ஆய்வு|பரிசோதனை|அறிக்கை|மருத்துவ அறிக்கை|தடுப்பூசி|தடுப்பூசிகள்|இம்யூனைக்சன்|கட்டணம்|பணம்|பில்)/;
 
-  // Shortcuts: strong signals even without verbs, across languages
+  // Shortcuts
   const shortcutLatin =
     /\b(lab|lab results?|appointment(s)?|immuni[sz]ation(s)?|vaccine(s)?|payment(s)?|bill(s)?)\b/.test(t) ||
     /\b(temujanji|imunisasi|vaksin|pembayaran|bayaran|bil|rekod|laporan|keputusan|makmal)\b/.test(t);
-
   const shortcutZH = zh.test(rawGoal);
   const shortcutTA = ta.test(rawGoal);
 
-  // Primary decision:
-  // - If Chinese or Tamil text contains those keywords -> agent
   if (label === "Chinese" && shortcutZH) return "healthhub_records";
   if (label === "Tamil" && shortcutTA) return "healthhub_records";
-
-  // - If Malay/English text contains both a verb and a record noun -> agent
   if ((label === "Malay" || label === "English") && verbsLatin.test(t) && nounsLatin.test(t)) {
     return "healthhub_records";
   }
-
-  // - If explicitly mentions HealthHub AND has nouns of interest -> agent
   if (mentionsHealthHub && (nounsLatin.test(t) || shortcutZH || shortcutTA)) {
     return "healthhub_records";
   }
-
-  // - Strong shortcut triggers (any language) -> agent
   if (shortcutLatin || shortcutZH || shortcutTA) return "healthhub_records";
 
-  // Otherwise -> chat
   return "chat";
 }
 
@@ -365,7 +345,6 @@ async function seedBridgeWithCurrent(tabId) {
 
 function looksLoggedIn(snap) {
   if (!snap || typeof snap !== "object") return false;
-
   if (snap.session && snap.session.is_authenticated === true) return true;
 
   const flags = snap.flags || {};
@@ -424,7 +403,6 @@ async function runOnce({ tabId, goal, label = "pass" }) {
 
     if (tool === "done" || tool === "fail") {
       log(`** ${tool.toUpperCase()}: ${JSON.stringify(args || {})}`);
-      // Speak only the backend-provided TTS string (if present) for DONE — in the user's prompt language
       if (tool === "done" && args && typeof args.tts === "string" && args.tts.trim()) {
         speakText(args.tts.trim());
       }
@@ -495,26 +473,130 @@ async function sendSimpleChat(prompt) {
   return res.json(); // { thread_id, reply }
 }
 
-/* ------------------------- Main: INTENT-ROUTED handler ------------------------- */
+/* ------------------------- STT helpers ------------------------- */
 
-async function onRun() {
+let _mediaStream = null;
+let _recorder = null;
+let _chunks = [];
+
+async function startRecording() {
+  _mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  _chunks = [];
+  _recorder = new MediaRecorder(_mediaStream, { mimeType: "audio/webm" });
+
+  _recorder.ondataavailable = (e) => {
+    if (e.data && e.data.size > 0) _chunks.push(e.data);
+  };
+
+  _recorder.onstop = async () => {
+    try {
+      const blob = new Blob(_chunks, { type: "audio/webm" });
+      await sendToSttAndRun(blob);
+    } catch (e) {
+      log(`STT error: ${e.message || e}`);
+    } finally {
+      _chunks = [];
+      if (_mediaStream) _mediaStream.getTracks().forEach(t => t.stop());
+      _mediaStream = null;
+      _recorder = null;
+    }
+  };
+
+  _recorder.start(250); // small chunks for responsiveness
+}
+
+function stopRecording() {
+  if (_recorder && _recorder.state !== "inactive") {
+    _recorder.stop();
+  }
+}
+
+async function sendToSttAndRun(blob) {
+  setMicStatus("Transcribing…");
+  const res = await fetch(`${STT_API}/transcribe`, {
+    method: "POST",
+    headers: { "Content-Type": "audio/webm" }, // FastAPI reads raw bytes
+    body: blob,
+  });
+  if (!res.ok) {
+    setMicStatus("STT failed");
+    throw new Error(`STT ${res.status}`);
+  }
+  const { text } = await res.json();
+  const cleaned = (text || "").trim();
+  if (!cleaned) {
+    setMicStatus("Couldn’t hear that. Try again?");
+    log("STT returned empty text");
+    return;
+  }
+
+  const box = document.getElementById("goal");
+  if (box) box.value = cleaned;
+
+  setMicStatus("Heard it. Running…");
+  await onRunWithGoal(cleaned);
+  setMicStatus("Idle");
+}
+
+function setMicStatus(s) {
+  const el = document.getElementById("mic_status");
+  if (el) el.textContent = s;
+}
+
+/* ------------------------- Mic permission helpers (fixes 'Permission dismissed') ------------------------- */
+
+function _openMicPermissionTab() {
+  return new Promise((resolve, reject) => {
+    const url = chrome.runtime.getURL("mic.html");
+    chrome.tabs.create({ url, active: true }, () => {
+      const timeout = setTimeout(() => {
+        chrome.runtime.onMessage.removeListener(onMsg);
+        reject(new Error("Mic permission timeout"));
+      }, 30000);
+
+      function onMsg(msg) {
+        if (msg?.type === "MIC_PERMISSION_GRANTED") {
+          clearTimeout(timeout);
+          chrome.runtime.onMessage.removeListener(onMsg);
+          resolve(true);
+        } else if (msg?.type === "MIC_PERMISSION_DENIED") {
+          clearTimeout(timeout);
+          chrome.runtime.onMessage.removeListener(onMsg);
+          reject(new Error(msg.error || "Mic permission denied"));
+        }
+      }
+      chrome.runtime.onMessage.addListener(onMsg);
+    });
+  });
+}
+
+async function _ensureMicPermissionThenRecord() {
+  try {
+    // Probe: will throw if blocked/dismissed
+    const test = await navigator.mediaDevices.getUserMedia({ audio: true });
+    test.getTracks().forEach(t => t.stop());
+    await startRecording();
+  } catch {
+    // Open a normal tab to trigger the browser permission UI
+    await _openMicPermissionTab();
+    await startRecording();
+  }
+}
+
+/* ------------------------- Main: INTENT-ROUTED handlers ------------------------- */
+
+async function onRunWithGoal(goalText) {
   const tab = await getActiveTab();
   if (!tab) return log("No active tab");
 
-  // Read goal from textbox
-  const rawGoal = (document.getElementById("goal")?.value || "").trim() || "view lab results";
+  const rawGoal = (goalText || "").trim() || "view lab results";
   const goal = sanitizeGoal(rawGoal);
 
-  // Decide routing BEFORE touching tabs
   const intent = decideIntent(rawGoal); // pass raw for multilingual detection
-
-  // Preferred TTS voice (used only for /speak)
   PREFERRED_LANG = detectLangFromPrompt(rawGoal);
 
   if (intent === "healthhub_records") {
-    // === Agent path: only for HealthHub records ===
     await chrome.runtime.sendMessage({ type: "START_TRACK_TAB", tabId: tab.id }).catch(() => {});
-
     await chrome.tabs.update(tab.id, { url: "https://www.healthhub.sg/" });
     await waitForTabNavigation(tab.id);
 
@@ -550,12 +632,10 @@ async function onRun() {
     _localMsgCount += 1;
     await refreshThreadInfoPanel();
   } else {
-    // === Simple chat path: do NOT call agent/run ===
     try {
       const r = await sendSimpleChat(rawGoal);
       log(`** Chat reply: ${r.reply}`);
-      speakText(r.reply); // optional TTS in prompt language
-
+      speakText(r.reply);
       _localMsgCount += 1;
       await refreshThreadInfoPanel(r.reply);
     } catch (e) {
@@ -564,12 +644,40 @@ async function onRun() {
   }
 }
 
+// Original button-driven entry point (kept for fallback typing)
+async function onRun() {
+  const rawGoal = (document.getElementById("goal")?.value || "").trim();
+  return onRunWithGoal(rawGoal);
+}
+
 /* ------------------------- DOM Ready ------------------------- */
 
 document.addEventListener("DOMContentLoaded", async () => {
-  document.getElementById("run").addEventListener("click", onRun);
+  const runBtn = document.getElementById("run");
+  if (runBtn) runBtn.addEventListener("click", onRun);
+
+  const micBtn = document.getElementById("mic");
+  if (micBtn) {
+    micBtn.addEventListener("click", async () => {
+      try {
+        if (_recorder && _recorder.state === "recording") {
+          setMicStatus("Stopping…");
+          stopRecording();
+          micBtn.textContent = "🎤 Speak";
+          return;
+        }
+        setMicStatus("Listening…");
+        micBtn.textContent = "⏹ Stop";
+        await _ensureMicPermissionThenRecord();
+      } catch (e) {
+        setMicStatus("Mic blocked? Check permissions.");
+        log(`Mic error: ${e.message || e}`);
+        micBtn.textContent = "🎤 Speak";
+      }
+    });
+  }
+
   await initThreadUi();
-  // Show quick health on load
   pingHealth(API, "agent_health");
   pingHealth(CHAT_API, "chat_health");
 });

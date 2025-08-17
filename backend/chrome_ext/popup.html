@@ -16,6 +16,8 @@
       #info { font-size: 12px; background:#f7f9fc; border:1px solid #e6eef8; padding:8px; border-radius:6px; }
       label { display:block; margin: 6px 0 2px; }
       .inline { display:flex; align-items:center; gap:8px; }
+      /* optional: nicer mic button */
+      #mic { padding:6px 10px; border-radius:8px; border:1px solid #ddd; background:#fff; cursor:pointer; }
     </style>
   </head>
   <body>
@@ -24,6 +26,12 @@
     <div class="row">
       <label for="goal">What would you like to do?</label>
       <textarea id="goal" placeholder="e.g. View my HealthHub lab results OR general questions like 'How to renew passport?'"></textarea>
+    </div>
+
+    <!-- NEW: Speech-to-text controls -->
+    <div class="row inline">
+      <button id="mic">🎤 Speak</button>
+      <span id="mic_status" class="small">Idle</span>
     </div>
 
     <!-- Thread controls: auto (default) or manual override -->
