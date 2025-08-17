@@ -29,28 +29,19 @@ services:
           target: /app
           action: sync
 
-  # scrape_ingest:
-  #   build:
-  #     context: ./backend/scrape_ingest
-  #   ports:
-  #     - "8002:8000"
-  #   env_file:
-  #     - ./backend/scrape_ingest/.env
-  #   environment:
-  #     - PYTHONUNBUFFERED=1
-  #   develop:
-  #     watch:
-  #       - path: ./backend/scrape_ingest
-  #         target: /app
-  #         action: sync
-
-  # frontend:
-  #   build:
-  #     context: ./frontend
-  #   ports:
-  #     - "8080:80"
-  #   develop:
-  #     watch:
-  #       - path: ./frontend
-  #         target: /usr/share/nginx/html
-  #         action: sync
+  # ───────── NEW: Sea Lion Chat API ─────────
+  chat_api:
+    build:
+      context: ./backend/chat_api
+    ports:
+      - "8003:8000"
+    env_file:
+      - ./backend/chat_api/.env
+    environment:
+      - PYTHONUNBUFFERED=1
+    develop:
+      watch:
+        - path: ./backend/chat_api
+          target: /app
+          action: sync
+    restart: unless-stopped

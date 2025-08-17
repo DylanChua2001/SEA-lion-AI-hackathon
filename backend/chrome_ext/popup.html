@@ -1,50 +1,57 @@
-<!doctype html>
+<!DOCTYPE html>
 <html>
-<head>
-  <meta charset="utf-8" />
-  <title>HealthHub Agent</title>
-  <style>
-    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 12px; width: 320px; }
-    h3 { margin: 0 0 6px; font-size: 16px; }
-    p.help { font-size:12px; color:#666; margin:8px 0 10px; }
-    textarea { width: 100%; min-height: 84px; padding:8px; border:1px solid #e5e7eb; border-radius:8px; resize: vertical; }
-    button { width: 100%; padding: 10px; margin-top: 10px; border: 0; border-radius: 8px; background:#10b981; color:white; font-weight:600; cursor:pointer; }
-    button:hover { filter: brightness(0.95); }
-    pre { white-space: pre-wrap; font-size: 12px; background: #f6f6f6; padding: 8px; max-height: 220px; overflow: auto; border-radius: 8px; border:1px solid #eee; }
-    /* Clarify box */
-    #clarify { display:none; border:1px solid #e5e7eb; border-radius:12px; padding:10px; margin:10px 0; background:#fafafa; }
-    #clarify-text { font-size:13px; margin-bottom:6px; }
-    #clarify-input { width:100%; min-height:60px; padding:8px; border:1px solid #e5e7eb; border-radius:8px; }
-    #clarify .actions { margin-top:6px; display:flex; gap:8px; }
-    #clarify .actions button { flex:1; padding:8px; margin-top:0; }
-    #clarify-ok { background:#3b82f6; }
-    #clarify-cancel { background:#9ca3af; }
-  </style>
-</head>
-<body>
-  <h3>HealthHub Agent</h3>
-  <p class="help">
-    The agent may pause to ask a question or for Singpass login. After you respond/login, click <b>Run Agent</b> again.
-  </p>
+  <head>
+    <meta charset="utf-8" />
+    <title>HealthHub Agent</title>
+    <style>
+      body { font-family: system-ui, sans-serif; width: 340px; margin: 10px; }
+      textarea { width: 100%; box-sizing: border-box; height: 72px; }
+      input[type="text"] { width: 100%; box-sizing: border-box; }
+      .row { margin: 6px 0; }
+      .small { font-size: 12px; color: #555; }
+      .pill { display:inline-block; padding:2px 6px; border-radius:10px; font-size:12px; }
+      .ok { background:#e6ffed; color:#036b26; }
+      .bad { background:#ffecec; color:#8a1f11; }
+      #log { white-space: pre-wrap; font-size: 12px; max-height: 180px; overflow-y: auto; background:#fafafa; border:1px solid #eee; padding:6px; }
+      #info { font-size: 12px; background:#f7f9fc; border:1px solid #e6eef8; padding:8px; border-radius:6px; }
+      label { display:block; margin: 6px 0 2px; }
+      .inline { display:flex; align-items:center; gap:8px; }
+    </style>
+  </head>
+  <body>
+    <h3>HealthHub Agent</h3>
 
-  <label for="goal" style="font-size:12px; color:#374151;">Your goal</label>
-  <textarea id="goal" placeholder="e.g., View my lab results from the past year"></textarea>
-  <audio id="tts-player" controls style="width:100%; margin-top:10px; display:none"></audio>
-
-  <!-- Clarification prompt (shown only when needed) -->
-  <div id="clarify" aria-live="polite">
-    <div id="clarify-text"></div>
-    <textarea id="clarify-input" rows="2" placeholder="Type your answer here…"></textarea>
-    <div class="actions">
-      <button id="clarify-ok" type="button">OK</button>
-      <button id="clarify-cancel" type="button">Cancel</button>
+    <div class="row">
+      <label for="goal">What would you like to do?</label>
+      <textarea id="goal" placeholder="e.g. View my HealthHub lab results OR general questions like 'How to renew passport?'"></textarea>
     </div>
-  </div>
 
-  <button id="run" type="button">Run Agent</button>
+    <!-- Thread controls: auto (default) or manual override -->
+    <div class="row">
+      <div class="inline">
+        <input type="checkbox" id="auto_thread" checked />
+        <label for="auto_thread" style="margin:0;">Auto-generate & remember thread</label>
+      </div>
+      <input id="thread_id" type="text" placeholder="(optional) custom thread id e.g. grandma-iphone" disabled />
+      <div class="small">When auto is on, a UUID is stored and reused. Uncheck to use your own ID.</div>
+    </div>
 
-  <pre id="log" aria-live="polite"></pre>
+    <div class="row inline">
+      <button id="run">Run</button>
+      <span id="agent_health" class="pill bad">agent: …</span>
+      <span id="chat_health" class="pill bad">chat: …</span>
+    </div>
 
-  <script src="popup.js"></script>
-</body>
+    <div id="info" class="row">
+      <div><strong>Thread:</strong> <span id="info_thread">(not set)</span></div>
+      <div><strong>Started:</strong> <span id="info_started">—</span></div>
+      <div><strong>Messages (this popup):</strong> <span id="info_msgcount">0</span></div>
+      <div><strong>Last reply:</strong> <span id="info_last">—</span></div>
+    </div>
+
+    <audio id="tts-player" controls style="display:none; width:100%; margin-top:6px;"></audio>
+    <pre id="log" class="row"></pre>
+
+    <script src="popup.js"></script>
+  </body>
 </html>

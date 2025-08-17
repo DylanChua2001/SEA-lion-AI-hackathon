@@ -7,7 +7,7 @@ from .config import SYSTEM
 from .supervisor import build_supervisor_app
 from .planner import messages_to_plan, done_reason
 
-SAFE_RECURSION_LIMIT = 20
+SAFE_RECURSION_LIMIT = 30
 
 
 def _coerce_page(page_state: str | Dict[str, Any] | None) -> Dict[str, Any]:
