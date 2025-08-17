@@ -1,0 +1,31 @@
+services:
+  api:
+    build:
+      context: .
+    ports:
+      - "8001:8001"
+    environment:
+      - PYTHONUNBUFFERED=1
+      - USE_MOCK_LLM=false
+      - VLLM_BASE_URL=http://vllm:8000/v1
+      - MODEL_ID=aisingapore/Gemma-SEA-LION-v3-9B-IT
+      - VLLM_CPU_ONLY=true
+      # Override if needed:
+      # - MONGODB_URI=mongodb://host.docker.internal:27017/lingolah_sea_lion_llm
+    depends_on:
+      - vllm
+
+  vllm:
+    image: vllm/vllm-openai:latest
+    command: ["python", "-m", "vllm.entrypoints.openai.api_server", "--model", "aisingapore/Gemma-SEA-LION-v3-9B-IT", "--host", "0.0.0.0", "--port", "8000", "--device", "cpu"]
+    ports:
+      - "8002:8000"
+    volumes:
+      - ./model_cache:/root/.cache/huggingface
+    # GPU is recommended for SEA-LION. Uncomment if you have NVIDIA GPU support enabled in Docker Desktop.
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - capabilities: ["gpu"]
+

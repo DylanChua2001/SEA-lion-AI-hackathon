@@ -1,5 +1,5 @@
 services:
-  backend:
+  tts_backend:
     build:
       context: ./backend/text_to_speech_api
     ports:
