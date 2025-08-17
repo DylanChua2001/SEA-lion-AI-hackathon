@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <title>Whisper Transcription Test</title>
+  </head>
+  <body>
+    <h1>Whisper API Test</h1>
+
+    <button id="startBtn">Start Recording</button>
+    <button id="stopBtn" disabled>Stop Recording</button>
+
+    <p><strong>Transcription:</strong></p>
+    <pre id="result">No transcription yet...</pre>
+
+    <script>
+      let mediaRecorder;
+      let audioChunks = [];
+
+      const startBtn = document.getElementById("startBtn");
+      const stopBtn = document.getElementById("stopBtn");
+      const resultEl = document.getElementById("result");
+
+      startBtn.onclick = async () => {
+        audioChunks = [];
+        const stream = await navigator.mediaDevices.getUserMedia({
+          audio: true,
+        });
+
+        mediaRecorder = new MediaRecorder(stream);
+        mediaRecorder.ondataavailable = (e) => audioChunks.push(e.data);
+
+        mediaRecorder.onstop = async () => {
+          const audioBlob = new Blob(audioChunks, { type: "audio/webm" });
+          const audioArrayBuffer = await audioBlob.arrayBuffer();
+          const audioUint8Array = new Uint8Array(audioArrayBuffer);
+
+          // Send to FastAPI backend
+          const res = await fetch("http://localhost:8000/transcribe", {
+            method: "POST",
+            headers: {
+              "Content-Type": "audio/webm",
+            },
+            body: audioUint8Array,
+          });
+
+          const data = await res.json();
+          resultEl.textContent = data.text || JSON.stringify(data);
+        };
+
+        mediaRecorder.start();
+        startBtn.disabled = true;
+        stopBtn.disabled = false;
+      };
+
+      stopBtn.onclick = () => {
+        mediaRecorder.stop();
+        startBtn.disabled = false;
+        stopBtn.disabled = true;
+      };
+    </script>
+  </body>
+</html>
