@@ -3,15 +3,28 @@
   "name": "Agentic HealthHub Assistant",
   "version": "1.0.0",
   "description": "LLM-guided assistant that runs tools in the current tab.",
-  "action": { "default_popup": "popup.html", "default_title": "HealthHub Agent" },
-  "permissions": ["activeTab", "scripting", "tabs"],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "HealthHub Agent"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "permissions": [
+    "storage",
+    "activeTab",
+    "scripting",
+    "tabs",
+    "webNavigation"
+  ],
   "host_permissions": [
     "<all_urls>",
     "http://localhost:8001/*",
     "http://127.0.0.1:8001/*",
+    "http://localhost:8003/*",
+    "http://127.0.0.1:8003/*",
     "https://www.healthhub.sg/*",
     "https://*.healthhub.sg/*",
     "https://*.singpass.gov.sg/*"
-  ],
-  "background": { "service_worker": "background.js" }
+  ]
 }

@@ -1,10 +1,12 @@
+# app/main.py
 import os
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from app.tools import set_latest_snapshot
 
-from .schemas import AgentRunRequest, AgentRunResponse, AgentMessage
-from .runner import run_one
+from .schemas import AgentRunRequest, AgentPlanResponse
+from .runner import run_plan_once
 
 load_dotenv()
 
@@ -23,27 +25,19 @@ app.add_middleware(
 async def health():
     return {"ok": True}
 
-def _serialize_messages(msgs) -> list[AgentMessage]:
-    out = []
-    for m in msgs:
-        # Use class name as a stable "type" (e.g., "AIMessage", "ToolMessage")
-        msg_type = m.__class__.__name__
-        content = getattr(m, "content", None)
-        tool_calls = getattr(m, "tool_calls", None)
-        name = getattr(m, "name", None)
-        out.append(AgentMessage(type=msg_type, content=content, tool_calls=tool_calls, name=name))
-    return out
+@app.post("/agent/run", response_model=AgentPlanResponse)
+async def agent_run(req: AgentRunRequest) -> AgentPlanResponse:
+    """
+    Stateless, single-shot planning endpoint.
+    Returns:
+      { "steps": [ { "tool": str, "args": dict }, ... ],
+        "hint":  { "summary"?: str } }
+    """
+    plan = run_plan_once(goal=req.goal, page_state=req.page_state)
+    # plan already matches AgentPlanResponse schema
+    return AgentPlanResponse(**plan)
 
-@app.post("/agent/run", response_model=AgentRunResponse)
-async def agent_run(req: AgentRunRequest) -> AgentRunResponse:
-    msgs = run_one(
-        goal=req.goal,
-        page_state=req.page_state,
-        last_tool=req.last_tool,
-        last_obs=req.last_observation,
-        # NEW:
-        user_reply=req.user_reply,
-        thread_id=req.thread_id or "web-agent",
-    )
-    return AgentRunResponse(messages=_serialize_messages(msgs))
-
+@app.post("/bridge/snapshot")
+async def bridge_snapshot(payload: dict):
+    set_latest_snapshot(payload)
+    return {"ok": True}

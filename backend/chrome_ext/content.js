@@ -1,111 +1,364 @@
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+// content.js (drop-in with flags + top_* for auth heuristics)
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/* ────────────────────────────── Visibility helpers ────────────────────────── */
+
+function isElementVisible(el) {
+  if (!el || el.nodeType !== 1) return false;
+  if (el.hasAttribute("hidden")) return false;
+  if (el.getAttribute("aria-hidden") === "true") return false;
+  if (el.hasAttribute("disabled") || el.getAttribute("aria-disabled") === "true") return false;
+
+  const cs = window.getComputedStyle(el);
+  if (!cs) return true;
+  if (cs.display === "none" || cs.visibility === "hidden" || parseFloat(cs.opacity || "1") === 0) return false;
+
+  const rect = el.getBoundingClientRect?.();
+  if (!rect) return true;
+  if (rect.width < 2 || rect.height < 2) return false;
+
+  return true;
+}
+
+/* ────────────────────────────── Selectors & Snapshot ──────────────────────── */
 
 function nodeToPath(el) {
-  if (!el) return null;
+  if (!el || el.nodeType !== 1) return null;
   if (el.id) return `#${CSS.escape(el.id)}`;
+
   const parts = [];
   let n = el;
   while (n && n.nodeType === 1 && parts.length < 6) {
     const name = n.tagName.toLowerCase();
-    const idx = Array.from(n.parentElement?.children || []).indexOf(n) + 1;
+    const parent = n.parentElement;
+    if (!parent) {
+      parts.unshift(name);
+      break;
+    }
+    const idx = Array.prototype.indexOf.call(parent.children, n) + 1;
     parts.unshift(`${name}:nth-child(${idx})`);
-    n = n.parentElement;
+    n = parent;
   }
   return parts.join(">");
 }
 
-function snapshot() {
-  const buttons = [...document.querySelectorAll("a,button,[role='button']")]
-    .slice(0, 400).map(b => ({
-      text: (b.innerText || "").trim().slice(0, 160),
-      selector: nodeToPath(b)
-    }));
-  const links = [...document.querySelectorAll("a[href]")]
-    .slice(0, 400).map(a => ({
-      text: (a.innerText || "").trim().slice(0, 200),
-      selector: nodeToPath(a),
-      href: a.href
-    }));
-  const inputs = [...document.querySelectorAll("input,textarea,select")]
-    .slice(0, 200).map(i => ({
-      name: i.name || i.id || i.placeholder || i.ariaLabel || "",
-      selector: nodeToPath(i)
-    }));
-  const raw_html = document.documentElement.outerHTML;
-  const nav_links = [...document.querySelectorAll('nav a,[role="navigation"] a')].slice(0, 200)
-    .map(a => ({ text: a.innerText.trim(), selector: nodeToPath(a), href: a.href }));
-  const breadcrumbs = [...document.querySelectorAll('[aria-label*="breadcrumb" i] a')].slice(0, 20)
-    .map(a => ({ text: a.innerText.trim(), selector: nodeToPath(a), href: a.href }));
-  const headings = [...document.querySelectorAll('h1,h2,[role="heading"]')].slice(0, 50)
-    .map(h => ({ text: (h.innerText || "").trim().slice(0, 200), selector: nodeToPath(h) }));
-  return { url: location.href, title: document.title, buttons, links, inputs, nav_links, breadcrumbs, headings, raw_html };
+function safeText(el) {
+  const t = (el?.innerText || el?.textContent || "").trim();
+  return t.replace(/\s+/g, " ");
 }
 
+function dedupeBySignature(arr, makeSig) {
+  const seen = new Set();
+  const out = [];
+  for (const item of arr) {
+    const sig = makeSig(item);
+    if (!sig || seen.has(sig)) continue;
+    seen.add(sig);
+    out.push(item);
+  }
+  return out;
+}
+
+/* ────────────────────────────── Page flags (auth) ─────────────────────────── */
+
+/**
+ * Best-effort read of page-scoped JS variables from inline scripts.
+ * We’re in a content-script isolated world, so we can’t access window vars directly.
+ * This scans <script> text for `var sslIsAnonymous = "True"|` patterns.
+ */
+function readFlagFromScripts(name) {
+  try {
+    const re = new RegExp(String.raw`${name}\s*=\s*["']?(True|False|true|false)["']?`, "i");
+    for (const s of document.scripts || []) {
+      const txt = s.textContent || "";
+      const m = re.exec(txt);
+      if (m) return m[1];
+    }
+  } catch {}
+  return null;
+}
+
+function extractAuthFlags() {
+  const url = (location.href || "").toLowerCase();
+
+  // sslIsAnonymous from inline scripts (if present)
+  const sslVar = readFlagFromScripts("sslIsAnonymous");
+  // Normalize to string "True"/"False" to match backend heuristic
+  const sslIsAnonymous =
+    sslVar == null ? null : (String(sslVar).toLowerCase() === "true" ? "True" : "False");
+
+  // Presence of a login affordance
+  const hasLoginButton =
+    !!document.querySelector(".btn-login, a[href*='login' i], button[aria-label*='login' i]");
+
+  // Singpass-like signals (URL or DOM text)
+  const DOM_TEXT_SAMPLE_LIMIT = 50;
+  let sampleText = "";
+  try {
+    // Grab a small slice of visible text to avoid heavy payloads
+    const nodes = Array.from(document.querySelectorAll("a,button,h1,h2,[role='heading']"))
+      .filter(isElementVisible)
+      .slice(0, DOM_TEXT_SAMPLE_LIMIT);
+    sampleText = nodes.map(safeText).join(" ").toLowerCase();
+  } catch {}
+
+  const singpassLike =
+    /singpass|login\.singpass|authorize|oauth|account\/login|myinfo/.test(url) ||
+    /singpass|myinfo/.test(sampleText);
+
+  return {
+    sslIsAnonymous,   // "True" | "False" | null
+    hasLoginButton,   // boolean
+    singpassLike,     // boolean
+  };
+}
+
+/* ────────────────────────────── Snapshot ──────────────────────────────────── */
+
+function snapshot() {
+  const q = (sel, limit = 200) => Array.from(document.querySelectorAll(sel)).slice(0, limit);
+  const MAX_BUTTONS = 400;
+  const MAX_LINKS = 400;
+  const MAX_INPUTS = 200;
+  const MAX_HEADINGS = 50;
+  const MAX_TEXTS = 300;
+
+  // Buttons (including anchors that behave like buttons)
+  let buttons = q("a,button,[role='button']", MAX_BUTTONS)
+    .filter(isElementVisible)
+    .map((b) => ({
+      text: safeText(b).slice(0, 160),
+      selector: nodeToPath(b),
+    }))
+    .filter((b) => b.selector && b.text);
+  buttons = dedupeBySignature(buttons, (x) => `${x.text}|||${x.selector}`).slice(0, MAX_BUTTONS);
+
+  // Links (true anchors)
+  let links = q("a[href]", MAX_LINKS)
+    .filter(isElementVisible)
+    .map((a) => ({
+      text: safeText(a).slice(0, 200),
+      selector: nodeToPath(a),
+      href: a.href,
+    }))
+    .filter((a) => a.selector && a.href);
+  links = dedupeBySignature(links, (x) => `${x.text}|||${x.href}`).slice(0, MAX_LINKS);
+
+  // Inputs
+  let inputs = q("input,textarea,select", MAX_INPUTS)
+    .filter(isElementVisible)
+    .map((i) => ({
+      name: i.name || i.id || i.placeholder || i.getAttribute("aria-label") || "",
+      placeholder: i.placeholder || "",
+      ariaLabel: i.getAttribute("aria-label") || "",
+      selector: nodeToPath(i),
+    }))
+    .filter((i) => i.selector);
+  inputs = dedupeBySignature(inputs, (x) => x.selector).slice(0, MAX_INPUTS);
+
+  // Headings
+  let headings = q("h1,h2,[role='heading']", MAX_HEADINGS)
+    .filter(isElementVisible)
+    .map((h) => ({
+      text: safeText(h).slice(0, 200),
+      selector: nodeToPath(h),
+    }))
+    .filter((h) => h.selector && h.text);
+  headings = dedupeBySignature(headings, (x) => `${x.text}|||${x.selector}`).slice(0, MAX_HEADINGS);
+
+  // Short label-like texts (helps report_name extraction)
+  let texts = Array.from(document.querySelectorAll("span,div,p,h1,h2,h3"))
+    .filter(isElementVisible)
+    .map((el) => safeText(el))
+    .filter((t) => t && t.length <= 120)
+    .map((t) => ({ text: t.slice(0, 120) }));
+  texts = dedupeBySignature(texts, (x) => x.text.toLowerCase()).slice(0, MAX_TEXTS);
+
+  // Navigation helpers
+  let nav_links = q('nav a,[role="navigation"] a', 200)
+    .filter(isElementVisible)
+    .map((a) => ({
+      text: safeText(a),
+      selector: nodeToPath(a),
+      href: a.href,
+    }))
+    .filter((a) => a.selector && a.href);
+  nav_links = dedupeBySignature(nav_links, (x) => `${x.text}|||${x.href}`).slice(0, 200);
+
+  let breadcrumbs = q('[aria-label*="breadcrumb" i] a', 20)
+    .filter(isElementVisible)
+    .map((a) => ({
+      text: safeText(a),
+      selector: nodeToPath(a),
+      href: a.href,
+    }))
+    .filter((a) => a.selector && a.href);
+  breadcrumbs = dedupeBySignature(breadcrumbs, (x) => `${x.text}|||${x.href}`).slice(0, 20);
+
+  // Build convenience “top_*” lists (text only) for the backend heuristics
+  const firstN = (arr, n) => arr.slice(0, n).map((x) => (x.text || "").trim()).filter(Boolean);
+  const top_buttons = firstN(buttons, 8);
+  const top_links = firstN(links, 8);
+  const top_headings = firstN(headings, 6);
+
+  // Auth/redirect flags
+  const flags = extractAuthFlags();
+
+  // Optional: a session object (leave minimal; backend checks `session.is_authenticated`)
+  // We can’t truly know from the DOM; set null/undefined unless you have a reliable signal.
+  const session = {
+    // is_authenticated: true/false  // intentionally omitted unless you can assert it
+  };
+
+  return {
+    url: location.href,
+    title: document.title,
+
+    buttons,
+    links,
+    inputs,
+    nav_links,
+    breadcrumbs,
+    headings,
+    texts,
+
+    // New convenience fields used by backend heuristics
+    top_buttons,
+    top_links,
+    top_headings,
+
+    // New flags for login detection
+    flags,
+    session,
+
+    // raw_html: undefined, // keep off by default
+  };
+}
+
+/* ────────────────────────────── Tools: find / click / type ─────────────────────── */
+
 function extractContains(q) {
-  // supports a:contains('Text') or :contains("Text")
-  const m = q.match(/:contains\((['"])(.*?)\1\)/i);
+  const m = (q || "").match(/:contains\((['"])(.*?)\1\)/i);
   return m ? m[2] : null;
+}
+
+function textCandidates(el) {
+  const out = [];
+  const t = safeText(el);
+  if (t) out.push(t.toLowerCase());
+  const aria = (el.getAttribute?.("aria-label") || "").trim();
+  if (aria) out.push(aria.toLowerCase());
+  const title = (el.getAttribute?.("title") || "").trim();
+  if (title) out.push(title.toLowerCase());
+  return out;
 }
 
 async function findImpl({ query, max = 10 }) {
   const raw = (query || "").trim();
   const contains = extractContains(raw);
-  let textQuery = contains || raw.replace(/^a:/i, "").trim();
+  const textQuery = (contains || raw.replace(/^a:/i, "").trim()).toLowerCase();
 
-  const all = [...document.querySelectorAll("a,button,[role='button']")];
-  const scored = all.map(el => {
-    const text = (el.innerText || "").trim();
+  if (!textQuery) return { matches: [], total: 0 };
+
+  const all = Array.from(document.querySelectorAll("a,button,[role='button']"))
+    .filter(isElementVisible);
+
+  const scored = [];
+
+  for (const el of all) {
+    const texts = textCandidates(el);
+    if (!texts.length) continue;
+
     let score = 0;
-    const t = text.toLowerCase();
-    const q = (textQuery || "").toLowerCase();
-    if (q && t.includes(q)) score += 10;
-    if (/appointment/.test(t)) score += 3;
-    return { el, text, score };
-  }).filter(x => x.score > 0);
+    for (const t of texts) {
+      if (t === textQuery) score += 20;
+      if (t.includes(textQuery)) score += 10;
+      if (t.startsWith(textQuery)) score += 3;
+    }
 
-  scored.sort((a, b) => b.score - a.score);
-  const top = scored.slice(0, max).map(x => ({
-    text: x.text,
-    selector: nodeToPath(x.el),
-    href: (x.el.tagName === "A" && x.el.href) ? x.el.href : null
-  }));
+    const st = texts.join(" ");
+    if (/\bappointment\b/i.test(st)) score += 2;
+    if (/\blab\b|\breport\b|\bresult\b/i.test(st)) score += 2;
 
-  // Align with backend: {matches,total}
+    if (score > 0) {
+      scored.push({ el, text: safeText(el), score });
+    }
+  }
+
+  scored.sort((a, b) => b.score - a.score || a.text.length - b.text.length);
+
+  const top = scored.slice(0, Math.max(1, Math.min(50, max))).map((x) => {
+    const el = x.el;
+    return {
+      text: x.text,
+      selector: nodeToPath(el),
+      href: el.tagName === "A" ? el.href : null,
+    };
+  });
+
   return { matches: top, total: top.length };
 }
 
 function robustClick(el) {
-  try { el.scrollIntoView({ block: "center", inline: "center" }); } catch {}
+  if (!el || el.nodeType !== 1) return;
+  try {
+    el.scrollIntoView({ block: "center", inline: "center" });
+  } catch {}
   const rect = el.getBoundingClientRect();
   const cx = rect.left + Math.max(1, Math.min(rect.width / 2, rect.width - 1));
   const cy = rect.top + Math.max(1, Math.min(rect.height / 2, rect.height - 1));
   el.dispatchEvent(new MouseEvent("mousemove", { bubbles: true, clientX: cx, clientY: cy }));
   el.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, clientX: cx, clientY: cy, button: 0 }));
   el.dispatchEvent(new MouseEvent("mouseup",   { bubbles: true, clientX: cx, clientY: cy, button: 0 }));
-  el.click();
+  try { el.click(); } catch {}
 }
 
 async function clickImpl({ selector, text, query }) {
   let el = selector ? document.querySelector(selector) : null;
+
   if (!el && (text || query)) {
-    const needle = (text || query || "").toLowerCase();
-    el = [...document.querySelectorAll("a,button,[role='button']")]
-      .find(e => (e.innerText || "").trim().toLowerCase().includes(needle));
+    const needle = (text || query || "").toLowerCase().trim();
+    if (needle) {
+      el = Array.from(document.querySelectorAll("a,button,[role='button']"))
+        .filter(isElementVisible)
+        .find((e) => {
+          const t = safeText(e).toLowerCase();
+          const aria = (e.getAttribute?.("aria-label") || "").toLowerCase();
+          return t.includes(needle) || aria.includes(needle);
+        });
+    }
   }
+
   if (!el) {
-    // Include selector in error so the backend can detect "same selector failed twice"
     return { ok: false, selector: selector || null, error: "element not found" };
   }
+
+  const disabled = el.hasAttribute?.("disabled") || el.getAttribute?.("aria-disabled") === "true";
+  const style = window.getComputedStyle?.(el);
+  const hidden = style && (style.visibility === "hidden" || style.display === "none");
+  if (disabled || hidden) {
+    return { ok: false, selector: nodeToPath(el), error: "element disabled or hidden" };
+  }
+
   robustClick(el);
-  const href = (el.tagName === "A" && el.href) ? el.href : null;
-  return { ok: true, selector: nodeToPath(el), href, navigating: !!href };
+  const href = el.tagName === "A" ? (el.href || null) : null;
+  const navigating = !!href;
+
+  return {
+    ok: true,
+    selector: nodeToPath(el),
+    href,
+    navigate_to: href,
+    navigating,
+  };
 }
 
 async function typeImpl({ selector, text, value }) {
-  // Accept both `text` (backend) and `value` (old callers)
-  const val = (text !== undefined) ? text : value;
-  const el = document.querySelector(selector);
+  const val = text !== undefined ? text : value;
+  const el = selector ? document.querySelector(selector) : null;
   if (!el) return { ok: false, selector, error: "input not found" };
+
   el.focus();
   try { el.value = ""; el.dispatchEvent(new Event("input", { bubbles: true })); } catch {}
   try { el.value = val ?? ""; el.dispatchEvent(new Event("input", { bubbles: true })); } catch {}
@@ -113,35 +366,38 @@ async function typeImpl({ selector, text, value }) {
   return { ok: true, selector, typed: val ?? "" };
 }
 
+/* ────────────────────────────── Wait / Nav helpers ─────────────────────────── */
+
 async function waitForImpl({ selector, timeout = 15000 }) {
-  const t0 = performance.now();
-  while (performance.now() - t0 < timeout) {
+  if (!selector) return { ok: false, selector, error: "missing selector" };
+  const start = performance.now();
+  while (performance.now() - start < Math.max(0, timeout)) {
     const el = document.querySelector(selector);
-    if (el) return { ok: true, selector };
+    if (el && isElementVisible(el)) return { ok: true, selector };
     await sleep(200);
   }
   return { ok: false, selector, error: "timeout" };
 }
 
 async function navImpl({ url }) {
+  if (!url) return { navigating: null };
   location.href = url;
   return { navigating: url };
 }
 
 async function waitForLoadImpl({ timeout = 20000 }) {
-  const t0 = performance.now();
-  while (document.readyState !== "complete" && performance.now() - t0 < timeout) {
+  const start = performance.now();
+  while (document.readyState !== "complete" && performance.now() - start < Math.max(0, timeout)) {
     await sleep(100);
   }
   return { state: document.readyState, url: location.href };
 }
 
 async function waitForIdleImpl({ quietMs = 600, timeout = 8000 }) {
-  // crude "network idle": wait until DOM is complete and nothing changes for quietMs
-  const tEnd = performance.now() + timeout;
+  const tEnd = performance.now() + Math.max(0, timeout);
   let last = document.body?.innerHTML?.length || 0;
   while (performance.now() < tEnd) {
-    await sleep(quietMs);
+    await sleep(Math.max(100, quietMs));
     const now = document.body?.innerHTML?.length || 0;
     if (document.readyState === "complete" && now === last) return { idle: true };
     last = now;
@@ -154,24 +410,31 @@ async function backImpl() {
   return { navigating: true };
 }
 
-// Optional: some models emit "wait" (milliseconds)
-async function waitImpl({ ms = 500 }) {
-  await sleep(ms);
-  return { waited: ms };
+async function waitImpl({ ms, seconds }) {
+  let durationMs = 500;
+  if (typeof seconds === "number") {
+    durationMs = Math.max(0, Math.min(60, seconds)) * 1000;
+  } else if (typeof ms === "number") {
+    durationMs = Math.max(0, ms);
+  }
+  await sleep(durationMs);
+  return { waited: durationMs };
 }
 
-const TOOL_IMPL = {
+/* ────────────────────────────── Tool Dispatch ─────────────────────────────── */
+
+const TOOL_IMPL = Object.freeze({
   get_page_state: async () => snapshot(),
   find: findImpl,
   click: clickImpl,
   type: typeImpl,
   wait_for: waitForImpl,
-  wait: waitImpl,              // NEW (optional)
+  wait: waitImpl,
   nav: navImpl,
   wait_for_load: waitForLoadImpl,
   wait_for_idle: waitForIdleImpl,
   back: backImpl,
-};
+});
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   (async () => {
@@ -181,21 +444,27 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         return;
       }
       if (msg?.type === "RUN_TOOL") {
-        const fn = TOOL_IMPL[msg.tool];
-        if (!fn) { sendResponse({ ok: false, data: { error: "unknown tool" } }); return; }
+        const tool = msg.tool;
+        const fn = TOOL_IMPL[tool];
+        if (!fn) {
+          sendResponse({ ok: false, data: { error: "unknown tool" } });
+          return;
+        }
         const data = await fn(msg.args || {});
-        // Normalize click/type/wait_for returns to { ok, data: {...} }
-        if (msg.tool === "click" || msg.tool === "type" || msg.tool === "wait_for") {
-          if (data && data.ok === false) { sendResponse({ ok: false, data }); return; }
+
+        if (tool === "click" || tool === "type" || tool === "wait_for") {
+          if (data && data.ok === false) {
+            sendResponse({ ok: false, data });
+            return;
+          }
           sendResponse({ ok: true, data });
           return;
         }
         sendResponse({ ok: true, data });
-      } else {
-        sendResponse({ ok: false, data: { error: "bad request" } });
+        return;
       }
+      sendResponse({ ok: false, data: { error: "bad request" } });
     } catch (e) {
-      // Include selector if present in args to help backend logs
       const sel = (msg?.args && (msg.args.selector || null)) || null;
       sendResponse({ ok: false, data: { selector: sel, error: e?.message || String(e) } });
     }
@@ -203,4 +472,4 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   return true;
 });
 
-console.log("[content] loaded");
+console.log("[content] loaded (with flags + top_* for auth heuristics)");
