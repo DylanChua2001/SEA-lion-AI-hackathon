@@ -1,31 +1,66 @@
 services:
-  tts_backend:
+  stt_backend:
     build:
-      context: ./backend/text_to_speech_api
+      context: ./backend/speech_to_text_api
     ports:
       - "8000:8000"
+    env_file:
+      - ./backend/speech_to_text_api/.env
+    environment:
+      - PYTHONUNBUFFERED=1
+    develop:
+      watch:
+        - path: ./backend/speech_to_text_api
+          target: /app
+          action: sync
+
+  tts_backend:
+    build:
+      context: ./backend/speech_to_text_api
+    ports:
+      - "8001:8001"
     env_file:
       - ./backend/text_to_speech_api/.env
     environment:
       - PYTHONUNBUFFERED=1
     develop:
       watch:
-        - path: ./backend/text_to_speech_api
+        - path: ./backend/speech_to_text_api
           target: /app
+          action: sync
+
+  stt_frontend:
+    build:
+      context: ./frontend/speech_to_text
+    ports:
+      - "8080:80"
+    develop:
+      watch:
+        - path: ./frontend/speech_to_text
+          target: /usr/share/nginx/html
+          action: sync
+
+  tts_frontend:
+    build:
+      context: ./frontend/text_to_speech
+    ports:
+      - "8081:80"
+    develop:
+      watch:
+        - path: ./frontend/text_to_speech
+          target: /usr/share/nginx/html
           action: sync
 
   llm_api:
     build:
-      context: ./backend/llm_api
+      context: ./backend/text_to_speech_api
     ports:
-      - "8001:8000"
-    env_file:
-      - ./backend/llm_api/.env
+      - "8001:8001"
     environment:
       - PYTHONUNBUFFERED=1
     develop:
       watch:
-        - path: ./backend/llm_api
+        - path: ./backend/text_to_speech_api
           target: /app
           action: sync
 
