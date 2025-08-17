@@ -10,7 +10,7 @@ def test_health():
     """Test health endpoint"""
     print("=== Testing Health ===")
     try:
-        response = requests.get("http://localhost:8001/healthz", timeout=5)
+        response = requests.get("http://54.151.209.144:8001/healthz", timeout=5)
         print(f"Status: {response.status_code}")
         print(f"Response: {response.json()}")
         return True
@@ -35,7 +35,7 @@ def test_chat():
     
     try:
         response = requests.post(
-            "http://localhost:8001/chat", 
+            "http://54.151.209.144:8001/chat", 
             json=payload, 
             timeout=30
         )
@@ -58,7 +58,7 @@ def test_openai_compatible():
     print("\n=== Testing OpenAI-Compatible Endpoint ===")
     
     payload = {
-        "model": "aisingapore/Llama-SEA-LION-v3.5-8B-R",
+        "model": "aisingapore/Gemma-SEA-LION-v3-9B-IT",
         "messages": [
             {"role": "system", "content": "You are a helpful assistant."},
             {"role": "user", "content": "Hello! How are you?"}
@@ -70,7 +70,7 @@ def test_openai_compatible():
     
     try:
         response = requests.post(
-            "http://localhost:8001/v1/chat/completions", 
+            "http://54.151.209.144:8001/v1/chat/completions", 
             json=payload, 
             timeout=30
         )

@@ -6,14 +6,14 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     # Mongo
-    MONGODB_URI: str = ""
+    MONGODB_URI: str = "mongodb+srv://lingolah:gs2uLV5YUrxXHKvL@lingolah.mbxwcxo.mongodb.net/?retryWrites=true&w=majority&appName=LingoLah"
     DB_NAME: str = "lingolah_sea_lion_llm"
 
     # vLLM (OpenAI-compatible)
     # Use 8002 by default to avoid conflicts with FastAPI app on 8001
-    VLLM_BASE_URL: str = "http://localhost:8002/v1"
+    VLLM_BASE_URL: str = "http://127.0.0.1:8001/v1"
     VLLM_API_KEY: str = "ignored"  # vLLM can accept a dummy API key
-    MODEL_ID: str = "aisingapore/Llama-SEA-LION-v3.5-8B-R"
+    MODEL_ID: str = "aisingapore/Gemma-SEA-LION-v3-9B-IT"
     LLM_TIMEOUT_SEC: int = 60
     USE_MOCK_LLM: bool = False
 
@@ -24,7 +24,8 @@ class Settings(BaseSettings):
     SESSION_TTL_HOURS: int = 24
     CONTEXT_LAST_N: int = 12
 
-    ADMIN_API_KEY: str = ""
+    ADMIN_API_KEY: str = "sk-xa4tlBRcll8VY-TFFnZiFA"
+    SEA_LION_API_URL: str = "https://api.sea-lion.ai/v1/chat/completions"
 
     model_config = SettingsConfigDict(
         env_file=".env",
